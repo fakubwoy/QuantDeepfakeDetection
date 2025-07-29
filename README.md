@@ -8,7 +8,7 @@ You can try the [deepfake detector](https://github.com/fakubwoy/QuantDeepfakeDet
 ## Getting Started 
  Clone the repository:
 ```sh
-$ git clone https://github.com/fakubwoy/QuantDeepfakeDetection.git
+git clone https://github.com/fakubwoy/QuantDeepfakeDetection.git
 ```
 
 ## Project Structure 
@@ -53,7 +53,6 @@ conda activate deepfake_env
 
 ```
 pip install -r requirements.txt
-
 ```
 
 ### Download the dataset
@@ -64,7 +63,6 @@ If you want to see the arguments that can be passed to download the dataset, run
 ```sh
 python3 dataset/download.py data -c c40 -d DeepFakeDetection --server EU2
 python3 dataset/download.py data -c c40 -d DeepFakeDetection_original --server EU2
-
 ```
 
 
