@@ -1,22 +1,17 @@
-# DeepFake Detection with PyTorch 🧐
+# Quantum DeepFake Detection
 
 The objective of this project is to distinguish between computer-generated (deepfake) and real individuals appearing in a video. However, it is important to note that this project is not optimized for identifying hyper-realistic generated images, but instead primarily focuses on analyzing screenshots taken from a video.
 
-You can try the [deepfake detector](https://huggingface.co/spaces/aaronespasa/deepfake-detection) by uploading a screenshot from a deepfake video (for example from YouTube) and see the results.
+You can try the [deepfake detector](https://github.com/fakubwoy/QuantDeepfakeDetection) by uploading a screenshot from a deepfake video (for example from YouTube) and see the results.
 
-<img src="https://github.com/aaronespasa/deepfake-detection/blob/main/thumbnail.png"/>
 
-<h3 align="center">
-  <a href="https://huggingface.co/spaces/aaronespasa/deepfake-detection">Click here to try the deepfake detector</a>
-</h3>
-
-## Getting Started 🛠
-🗂 Clone the repository (the command below uses HTTPS):
+## Getting Started 
+ Clone the repository:
 ```sh
-$ git clone https://github.com/aaronespasa/deepfake-detection.git
+$ git clone https://github.com/fakubwoy/QuantDeepfakeDetection.git
 ```
 
-## Project Structure 🗂
+## Project Structure 
 
 ```
 deepfake-detection
@@ -47,37 +42,23 @@ metrics                 # Metrics to be used in the model
 │ gitignore  
 ```
 
-## Set-Up Environment 🌲 
+## Set-Up Environment  
 ### Install the necessary dependencies
-1. Install PyTorch and Cuda on a new conda environment ([PyTorch Anaconda commands](https://pytorch.org/get-started/locally/)):
-```sh
- conda create --name pytorch python=3.8
- conda activate pytorch
- conda install pytorch torchvision torchaudio cudatoolkit=11.3 -c pytorch
+1. Create and activate a new conda environment:
 ```
-
-2. Install OpenCV:
-```sh
- pip install opencv-python
- python -c "import cv2; print(cv2.__version__)"
+conda create --name deepfake_env python=3.8
+conda activate deepfake_env
 ```
+2. Install dependencies using requirements.txt:
 
-3. Install Numpy, Matplotlib and Tqdm:
-```sh
- conda install -c conda-forge numpy matplotlib tqdm
 ```
+pip install -r requirements.txt
 
-4. Install Albumentations:
-```sh
- pip install albumentations
 ```
 
 ### Download the dataset
 If you want to see the arguments that can be passed to download the dataset, run the following command:
 
-```sh
- python dataset/download.py -h
-```
 
 1. Download the FaceForensics++ dataset:
 ```sh
@@ -85,9 +66,9 @@ python3 dataset/download.py data -c c40 -d DeepFakeDetection --server EU2
 python3 dataset/download.py data -c c40 -d DeepFakeDetection_original --server EU2
 
 ```
-> Using -c c40 we get the maximum compression to download them fastly.
 
-## Download the Pretrained Model 🔍
+
+## Download the Pretrained Model 
 
 This project uses a pretrained classifier model (`resnetinceptionv1_epoch_32.pth`) for inference. Make sure to download this file and place it in the `models/` directory.
 
@@ -98,39 +79,10 @@ git lfs install
 git lfs pull --include="models/resnetinceptionv1_epoch_32.pth"
 ```
 If you have not cloned the repo with git lfs, you can install Git LFS and then pull the file manually. Otherwise, you'll see a pointer file instead of the actual model weights, which will result in loading errors.
-## Train the model 🛠
+## Train the model 
 ```sh
  python training.py
 ```
-
-## Roadmap
-
-Binary Image Classifier:
-
-- [x] Extract image frame from the videos.
-- [x] Use a MTCNN to detect the faces and create a new dataset.
-- [x] Filter the data (remove images which do not contain faces).
-- [x] Data Augmentation.
-- [x] Weights & Biases integration.
-- [x] Binary Image Classifier of DeepFakes using a non-SOTA architecture (ex.: InceptionV3 or ResNet50).
-- [ ] Binary Image Classifier of DeepFakes using a SOTA architecture (ex. Vision Transformers).
-- [x] Evaluate the image classifier model using Class Activation Maps.
-- [x] Model Deployment (for images) using Gradio.
-- [x] Write an article describing the project.
-
-Binary Video Classifier:
-
-- [ ] Binary Video Classifier of DeepFakes.
-- [ ] Evaluate the video classifier model using Class Activation Maps.
-- [ ] Model Deployment (for videos) using Streamlit.
-- [ ] Write an article describing how to improve the binary image classifier to work with video.
-
-Binary Video Classifier including audio:
-- [ ] Binary Classifier for DeepFakes using audio (implementing a Transformer architecture)
-- [ ] Model evaluation.
-- [ ] Model deployment using PyTorch Live.
-- [ ] Write an article describing how to improve the binary video classifier to work with audio.
-- [ ] Write a tutorial describing how to do the project.
 
 ## Dataset
 
@@ -140,5 +92,18 @@ Binary Video Classifier including audio:
 
 [Kaggle Dataset augmented by Meta](https://ai.facebook.com/datasets/dfdc/): Dataset from the kaggle competition with more resources provided by Meta.
 
-## Presentation
-https://docs.google.com/presentation/d/1KARG_bZaV0GYAYgLdSvQiYWm0klWpf7X/edit?usp=sharing&ouid=104796589432459456901&rtpof=true&sd=true
+## TODO: Quantum Enhanced Deepfake Detection
+
+This section outlines future research to explore how quantum algorithms can improve deepfake detection. Quantum Machine Learning (QML) could offer significant advantages due to its ability to process complex data in unique ways.
+
+### Research & Implementation Areas:
+
+* **Quantum Feature Detection:** Use quantum methods to find tiny, hidden patterns in deepfakes that classical methods might miss.
+* **Hybrid Quantum-Classical Models:** Combine our existing PyTorch models with quantum components to boost accuracy and resilience.
+* **Quantum Kernels:** Explore quantum techniques that make it easier to separate real from fake data, potentially leading to better classification.
+* **Quantum GANs (QGANs):** Investigate using QGANs to understand how deepfakes are created (for defense) or even to generate new, harder-to-detect fakes for testing.
+* **Quantum Frequency Analysis:** Apply quantum versions of signal processing to analyze video frames for deepfake artifacts in the frequency domain.
+* **Quantum Optimization:** Use quantum algorithms to make our detection models train faster or perform better.
+* **Quantum Tools & Platforms:** Experiment with quantum programming tools like Qiskit or PennyLane to test these ideas.
+
+Ultimately, we aim for **more accurate, efficient, and robust deepfake detection** by leveraging the power of quantum computing.
