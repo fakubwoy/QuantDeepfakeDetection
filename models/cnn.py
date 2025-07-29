@@ -1,13 +1,12 @@
-# Imports
 import torch
-import torchvision # torch package for vision related things
-import torch.nn.functional as F  # Parameterless functions, like (some) activation functions
-import torchvision.datasets as datasets  # Standard datasets
-import torchvision.transforms as transforms  # Transformations we can perform on our dataset for augmentation
-from torch import optim  # For optimizers like SGD, Adam, etc.
-from torch import nn  # All neural network modules
-from torch.utils.data import DataLoader  # Gives easier dataset managment by creating mini batches etc.
-from tqdm import tqdm  # For nice progress bar!
+import torchvision 
+import torch.nn.functional as F  
+import torchvision.datasets as datasets  
+import torchvision.transforms as transforms 
+from torch import optim  
+from torch import nn  
+from torch.utils.data import DataLoader 
+from tqdm import tqdm 
 import cv2
 import os
 from torchvision.io import read_image
@@ -16,9 +15,6 @@ from torch.utils.data import Dataset
 from torchvision import datasets
 from torchvision.transforms import ToTensor
 import numpy as np
-
-
-
 
 DATA_FOLDER = os.path.join("..", "data")
 ORIGINAL_VIDEOS_FOLDER = os.path.join(
@@ -33,13 +29,6 @@ FACES_FAKE = os.path.join(FACES_FOLDER, "fake")
 CARAS = os.path.join(FACES_FOLDER, "caras")
 FACES_CSV = os.path.join(FACES_FOLDER, "faces2.csv")
 
-
-
-
-
-
-
-# Simple CNN
 class CNN(nn.Module):
     def __init__(self, in_channels=3, num_classes=2):
         super(CNN, self).__init__() 
@@ -73,9 +62,6 @@ class CNN(nn.Module):
   
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-
 
 class CustomImageDataset(Dataset):
     def __init__(self, annotations_file, img_dir, transforms = None):
@@ -124,26 +110,16 @@ test_loader = DataLoader(dataset=test_set, batch_size= batch_size, shuffle=True)
 
 
 
-# Initialize network
 model = CNN(in_channels=in_channels, num_classes=num_classes).to(device)
 
-# Loss and optimizer
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-# Train Network
 for epoch in range(num_epochs):
     for batch_idx, (data, targets) in enumerate(tqdm(train_loader)):
-
-        # forward
         scores = model(data)
         loss = criterion(scores, targets)
-
-        # backward
         optimizer.zero_grad()
         loss.backward()
-
-        # gradient descent or adam step
         optimizer.step()
-#aqui no tenemos que cambiar el tamaño porque es algo que ya hemos hecho en la preparacion de la red
 
