@@ -31,6 +31,13 @@ FACES_CSV = os.path.join(FACES_FOLDER, "faces2.csv")
 
 class CNN(nn.Module):
     def __init__(self, in_channels=3, num_classes=2):
+        """
+        Initializes the CNN model.
+
+        Args:
+            in_channels (int, optional): Number of input channels. Defaults to 3.
+            num_classes (int, optional): Number of output classes. Defaults to 2.
+        """
         super(CNN, self).__init__() 
         self.conv1 = nn.Conv2d(
             in_channels=in_channels,
@@ -51,6 +58,15 @@ class CNN(nn.Module):
         self.fc1 = nn.Linear(16 * 64 * 64, num_classes)#256x256
  
     def forward(self, x):
+        """
+        Forward pass of the CNN model.
+
+        Args:
+            x (torch.Tensor): Input image tensor with shape (batch_size, channels, height, width).
+
+        Returns:
+            torch.Tensor: Output tensor after passing through the CNN with shape (batch_size, num_classes).
+        """
         x = F.relu(self.conv1(x))
         x = self.pool(x)
         x = F.relu(self.conv2(x))
@@ -65,15 +81,39 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class CustomImageDataset(Dataset):
     def __init__(self, annotations_file, img_dir, transforms = None):
+        """
+        Args:
+            annotations_file (str): Path to the CSV file containing the labels of the images.
+            img_dir (str): Path to the directory containing the images.
+            transforms (list of callable, optional): Optional list of transformations to apply to each image.
+        """
+        
         self.img_labels = pd.read_csv(annotations_file)
         self.img_dir = img_dir
         self.transforms = transforms
 
     def __len__(self):
+        
+        """
+        Returns the total number of images in the dataset.
+
+        Returns:
+            int: The number of images.
+        """
+
         return len(self.img_labels)
 
     def __getitem__(self, idx):
 
+        """
+        Loads an image from the dataset and applies any specified transformations to it.
+
+        Args:
+            idx (int): Index of the image to load.
+
+        Returns:
+            tuple: A tuple containing the image and its label.
+        """
         if  self.img_labels.iloc[idx, 2] == 'real':
             img_path = os.path.join(self.img_dir, 'real',  str(self.img_labels.iloc[idx, 1]))
         else:

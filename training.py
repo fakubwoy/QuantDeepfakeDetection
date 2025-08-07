@@ -20,7 +20,17 @@ CLASS_NAMES = {0: "real", 1: "fake"}
 
 
 def make(config):
-    """Create the dataloaders, the model, the criterion & the optimizer"""
+    """
+    Create the data loaders, model, loss function, and optimizer.
+
+    Args:
+        config (wandb.Config or dict): Configuration containing model and training parameters.
+
+    Returns:
+        tuple: Contains the model, training data loader, validation data loader, loss function,
+               and optimizer.
+    """
+
     if isinstance(config, wandb.Config):
         print("Using the configuration from wandb.config")
     elif isinstance(config, dict):
@@ -96,7 +106,18 @@ def get_data(
 
 
 def make_loader(dataset, batch_size):
-    """Create the Data Loader for the dataset."""
+    
+    """
+    Create a DataLoader for the given dataset.
+
+    Args:
+        dataset (Dataset): The dataset to load data from.
+        batch_size (int): The number of samples per batch to load.
+
+    Returns:
+        DataLoader: A DataLoader object for the dataset.
+    """
+
     loader = data_utils.DataLoader(
         dataset=dataset,
         batch_size=batch_size,
@@ -108,7 +129,21 @@ def make_loader(dataset, batch_size):
 
 
 def train_batch(images, labels, model, criterion, split="training", optimizer=None):
-    """Train a batch of data."""
+    
+    """
+    Train a batch of data.
+
+    Args:
+        images (torch.Tensor): Input images with shape (batch_size, channels, height, width)
+        labels (torch.Tensor): Labels corresponding to the images with shape (batch_size,)
+        model (nn.Module): The model to train
+        criterion (nn.Module): The loss function to use
+        split (str, optional): The split of data to use: 'training' or 'validation'. Defaults to "training"
+        optimizer (optim.Optimizer, optional): The optimizer to use for backward pass and optimization
+
+    Returns:
+        tuple: Contains the loss and accuracy of the batch
+    """
     if split == "training":
         assert optimizer is not None, "Optimizer must be provided for training"
     assert split in [
@@ -136,6 +171,16 @@ def train_batch(images, labels, model, criterion, split="training", optimizer=No
 
 def model_pipeline(hyperparameters):
     # tell wandb to get started
+    """
+    Executes the machine learning pipeline for training a model using Weights and Biases (wandb) for experiment tracking.
+
+    Args:
+        hyperparameters (dict): Dictionary containing hyperparameters for model configuration and training.
+
+    Returns:
+        nn.Module: The trained model.
+    """
+
     with wandb.init(project="deepfake-detection", config=hyperparameters):
         # access all HPs through wandb.config, so logging matches execution!
         config = wandb.config
@@ -150,6 +195,16 @@ def model_pipeline(hyperparameters):
 
 
 def save_model(model, optimizer, loss, base_path, epoch):
+    """
+    Saves the model, optimizer state and the validation loss to a file.
+
+    Args:
+        model (nn.Module): The model.
+        optimizer (torch.optim.Optimizer): The optimizer.
+        loss (float): The validation loss.
+        base_path (str): The base path of the file to save the model to.
+        epoch (int): The current epoch.
+    """
     torch.save(
         {
             "epoch": epoch,
@@ -162,7 +217,20 @@ def save_model(model, optimizer, loss, base_path, epoch):
 
 
 def train(model, train_loader, val_loader, criterion, optimizer, config):
-    """Train the model and save the information on Weights and Biases."""
+    """
+    Trains a model using the given data and optimizer configuration.
+
+    Args:
+        model (nn.Module): The model to train.
+        train_loader (DataLoader): The data loader for the training data.
+        val_loader (DataLoader): The data loader for the validation data.
+        criterion (nn.Module): The loss function.
+        optimizer (torch.optim.Optimizer): The optimizer.
+        config (wandb.config.Config): The hyperparameter configuration.
+
+    Returns:
+        dict: A dictionary containing the training and validation loss and accuracy.
+    """
     print("Beginning training 🎨")
     wandb.watch(model, criterion, log="all", log_freq=10)
 

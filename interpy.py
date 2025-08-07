@@ -87,7 +87,21 @@ face_with_mask = cv2.addWeighted(face_image_to_plot_uint8, 1, visualization, 0.5
 
 
 def predict(input_image:Image.Image, true_label:str):
-    """Predict the label of the input_image and generate a GradCAM visualization."""
+    """
+    Predict the label of the input_image and generate a GradCAM visualization.
+
+    Args:
+    input_image (Image.Image): The input image from which the face is to be detected and predicted.
+    true_label (str): The true label of the input image for reference.
+
+    Returns:
+    tuple: A tuple containing:
+        - confidences (dict): A dictionary with prediction confidences for 'real' and 'fake' labels.
+        - true_label (str): The true label provided as input.
+        - face_with_cam_overlay (Image.Image or None): An image with GradCAM overlay on the detected face, 
+          or None if no face is detected.
+    """
+
     face = mtcnn(input_image)
     if face is None:
         return {'real': 0.0, 'fake': 0.0}, "No face detected!", None 
