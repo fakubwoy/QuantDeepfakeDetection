@@ -98,6 +98,7 @@ __pypackages__/
 celerybeat-schedule
 celerybeat.pid
 
+./examples
 # SageMath parsed files
 *.sage.py
 gradio_cached_examples

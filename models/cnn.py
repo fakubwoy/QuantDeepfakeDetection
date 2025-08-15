@@ -1,125 +1,72 @@
 import torch
-import torchvision 
-import torch.nn.functional as F  
-import torchvision.datasets as datasets  
-import torchvision.transforms as transforms 
-from torch import optim  
-from torch import nn  
-from torch.utils.data import DataLoader 
-from tqdm import tqdm 
-import cv2
-import os
-from torchvision.io import read_image
-import pandas as pd
-from torch.utils.data import Dataset
-from torchvision import datasets
-from torchvision.transforms import ToTensor
-import numpy as np
+import torch.nn as nn
 
-DATA_FOLDER = os.path.join("..", "data")
-ORIGINAL_VIDEOS_FOLDER = os.path.join(
-    DATA_FOLDER, "original_sequences", "actors", "c40", "videos"
-)
-FAKE_VIDEOS_FOLDER = os.path.join(
-    DATA_FOLDER, "manipulated_sequences", "DeepFakeDetection", "c40", "videos"
-)
-FACES_FOLDER = os.path.join(DATA_FOLDER, "faces")
-FACES_REAL = os.path.join(FACES_FOLDER, "real")
-FACES_FAKE = os.path.join(FACES_FOLDER, "fake")
-CARAS = os.path.join(FACES_FOLDER, "caras")
-FACES_CSV = os.path.join(FACES_FOLDER, "faces2.csv")
+# Qiskit Imports
+from qiskit import QuantumCircuit
+from qiskit.circuit.library import ZZFeatureMap, RealAmplitudes # Added RealAmplitudes
+from qiskit_machine_learning.neural_networks import EstimatorQNN
+from qiskit_machine_learning.connectors import TorchConnector
 
-class CNN(nn.Module):
-    def __init__(self, in_channels=3, num_classes=2):
-        super(CNN, self).__init__() 
-        self.conv1 = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=8,
-            kernel_size=(3, 3), stride=(1, 1),
-            padding=(1, 1),
-        )
+class HybridCNN(nn.Module):
+    """
+    Hybrid Quantum-Classical Convolutional Neural Network.
+    """
+    def __init__(self, num_qubits=4, num_classes=1):
+        super(HybridCNN, self).__init__()
         
-        self.pool = nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2))
-        self.conv2 = nn.Conv2d(
-            in_channels=8,
-            out_channels=16,
-            kernel_size=(3, 3),
-            stride=(1, 1),
-            padding=(1, 1),
+        # --- Classical Part ---
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=8, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(8)
+        self.relu1 = nn.ReLU()
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        self.conv2 = nn.Conv2d(in_channels=8, out_channels=16, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(16)
+        self.relu2 = nn.ReLU()
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        self.feature_reducer = nn.Linear(16 * 64 * 64, num_qubits)
+        self.relu3 = nn.ReLU()
+
+        # --- Quantum Part ---
+        # 1. Encode the classical data using ZZFeatureMap
+        feature_map = ZZFeatureMap(feature_dimension=num_qubits, reps=1)
+        
+        # 2. Add a trainable quantum circuit (ansatz) to act as a neural network layer
+        ansatz = RealAmplitudes(num_qubits, reps=1)
+        
+        # 3. Combine them into a single circuit
+        qc = QuantumCircuit(num_qubits)
+        qc.compose(feature_map, inplace=True)
+        qc.compose(ansatz, inplace=True)
+
+        # 4. Wrap the circuit in a QNN, specifying which parameters are for input and which are trainable weights
+        qnn = EstimatorQNN(
+            circuit=qc,
+            input_params=feature_map.parameters,
+            weight_params=ansatz.parameters  # These are now trainable weights
         )
-     
-        self.fc1 = nn.Linear(16 * 64 * 64, num_classes)#256x256
- 
+
+        # 5. Wrap the QNN in a TorchConnector
+        self.q_layer = TorchConnector(qnn)
+        
+        # Final classical layer to map the single quantum output to the desired class format
+        self.final_fc = nn.Linear(1, num_classes)
+
     def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = self.pool(x)
-        x = F.relu(self.conv2(x))
-        x = self.pool(x)
+        # --- Classical Feature Extraction ---
+        x = self.pool1(self.relu1(self.bn1(self.conv1(x))))
+        x = self.pool2(self.relu2(self.bn2(self.conv2(x))))
+        
         x = x.reshape(x.shape[0], -1)
-        x = self.fc1(x)
+        
+        # --- Bottleneck ---
+        x = self.relu3(self.feature_reducer(x))
+        
+        # --- Quantum Processing ---
+        x = self.q_layer(x)
+        
+        # --- Final Classification ---
+        x = self.final_fc(x)
+
         return x
-
-  
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-class CustomImageDataset(Dataset):
-    def __init__(self, annotations_file, img_dir, transforms = None):
-        self.img_labels = pd.read_csv(annotations_file)
-        self.img_dir = img_dir
-        self.transforms = transforms
-
-    def __len__(self):
-        return len(self.img_labels)
-
-    def __getitem__(self, idx):
-
-        if  self.img_labels.iloc[idx, 2] == 'real':
-            img_path = os.path.join(self.img_dir, 'real',  str(self.img_labels.iloc[idx, 1]))
-        else:
-            img_path = os.path.join(self.img_dir, 'fake', str(self.img_labels.iloc[idx, 1]))
-
-        image = cv2.imread(img_path)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image = image / 255.0
-        image = image.astype(np.float32)
-
-        if self.transforms:
-            image = self.transforms(image)
-
-        label = self.img_labels.iloc[idx, 2]
-
-        return image, label
-
-
-data = CustomImageDataset(FACES_CSV, FACES_FOLDER, transforms.ToTensor())
-print(data[6])
-
-in_channels = 3
-num_classes = 2
-learning_rate = 0.001
-batch_size = 64
-num_epochs = 1
-
-
-dataset = CustomImageDataset(FACES_CSV, FACES_FOLDER, transforms.ToTensor())
-
-train_set, test_set = torch.utils.data.random_split(dataset, [3000, 215])
-train_loader = DataLoader(dataset=train_set, batch_size= batch_size, shuffle=True)
-test_loader = DataLoader(dataset=test_set, batch_size= batch_size, shuffle=True)
-
-
-
-model = CNN(in_channels=in_channels, num_classes=num_classes).to(device)
-
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-
-for epoch in range(num_epochs):
-    for batch_idx, (data, targets) in enumerate(tqdm(train_loader)):
-        scores = model(data)
-        loss = criterion(scores, targets)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
