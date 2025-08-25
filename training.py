@@ -1,41 +1,30 @@
 import os
 import torch
-import wandb
-import pandas as pd
-import albumentations
-import torch.nn as nn
+import torch.utils.data as data_utils
+from torch import nn
+from torch import optim
+from facenet_pytorch import InceptionResnetV1
 from tqdm import tqdm
-from torch.utils.data import DataLoader
-from albumentations.pytorch import ToTensorV2
+import pandas as pd
 from sklearn.model_selection import train_test_split
-
-# Import the new Hybrid Model
-from models.cnn import HybridCNN
+import wandb
+# NEW IMPORTS for image transformation
+import albumentations
+from albumentations.pytorch import ToTensorV2
+from utils.denormalize_image import denormalize_image
+from utils.metrics import get_accuracy
+from utils.dict_to_struct import DictStructure
 from dataset.faces import FaceDataset
 
 # --- Constants ---
+DATA_ROOT = "data" 
+FACES_CSV = os.path.join(DATA_ROOT, "faces", "faces.csv")
+VALIDATION_SPLIT = 0.2
+IMG_WIDTH = 224 # Standard size for InceptionResnetV1
+IMG_HEIGHT = 224
+CLASS_NAMES = {0: "real", 1: "fake"}
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-DATA_FOLDER = "./data"
-TRAIN_BATCH_SIZE = 16
-VAL_BATCH_SIZE = 16
-IMG_WIDTH = 256
-IMG_HEIGHT = 256
-NUM_WORKERS = 4
-CHECKPOINT_PATH = "./models"
 
-def get_datasets(data_folder, val_size=0.2):
-    """
-    Reads the faces.csv file and splits the data into training and validation sets.
-    """
-    faces_csv = os.path.join(data_folder, "faces", "faces.csv")
-    faces_df = pd.read_csv(faces_csv)
-    print(f"Original dataset length: {len(faces_df)}")
-    
-    train_df, val_df = train_test_split(faces_df, test_size=val_size, random_state=42, stratify=faces_df["label"])
-    print(f"training dataset length ({1-val_size:.1%}): {len(train_df)}")
-    print(f"validation dataset length ({val_size:.1%}): {len(val_df)}")
-    
-    return train_df, val_df
 
 def get_transforms(img_width, img_height):
     """
@@ -44,130 +33,217 @@ def get_transforms(img_width, img_height):
     train_transform = albumentations.Compose([
         albumentations.Resize(img_width, img_height),
         albumentations.HorizontalFlip(p=0.5),
-        albumentations.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, rotate_limit=15, p=0.5),
-        albumentations.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        albumentations.Affine(
+            scale=(0.95, 1.05),
+            translate_percent=(-0.05, 0.05),
+            rotate=(-15, 15),
+            p=0.5
+        ),
+        albumentations.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ToTensorV2(),
     ])
     val_transform = albumentations.Compose([
         albumentations.Resize(img_width, img_height),
-        albumentations.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        albumentations.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ToTensorV2(),
     ])
     return train_transform, val_transform
 
-def make_model(config):
-    """
-    Instantiates the model, optimizer, criterion, and scheduler.
-    """
-    model = HybridCNN(num_qubits=4, num_classes=config.classes).to(DEVICE)
+
+def make(config):
+    """Create the dataloaders, the model, the criterion & the optimizer"""
+    if isinstance(config, wandb.Config):
+        print("Using the configuration from wandb.config")
+    elif isinstance(config, dict):
+        print("Not using the configuration from wandb.config")
+        config = DictStructure(config)
+    else:
+        raise ValueError("config must be a wandb.Config or a dict")
+
+    # --- Data Preparation ---
+    faces_df = pd.read_csv(FACES_CSV)
+    print(f"Original dataset length: {len(faces_df)}")
+
+    train_df, val_df = train_test_split(
+        faces_df, 
+        test_size=VALIDATION_SPLIT, 
+        random_state=42, 
+        stratify=faces_df["label"]
+    )
+    print(f"Training dataset length: {len(train_df)}")
+    print(f"Validation dataset length: {len(val_df)}")
+
+    train_transform, val_transform = get_transforms(IMG_WIDTH, IMG_HEIGHT)
     
+    train_dataset = FaceDataset(DATA_ROOT, train_df, transform=train_transform)
+    val_dataset = FaceDataset(DATA_ROOT, val_df, transform=val_transform)
+
+    train_loader = make_loader(train_dataset, batch_size=config.batch_size)
+    val_loader = make_loader(val_dataset, batch_size=config.batch_size)
+    
+    # --- Model, Loss, and Optimizer ---
+    model = InceptionResnetV1(
+        pretrained=config.pretrained_dataset,
+        classify=True,
+        num_classes=config.classes,
+        device=DEVICE,
+    )
+
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
     
-    # Add a learning rate scheduler to reduce LR on plateau
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.1, patience=2, verbose=True)
+    # ADDED: Learning rate scheduler to prevent overfitting
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.1, patience=2)
+
+    return model, train_loader, val_loader, criterion, optimizer, scheduler
+
+
+def make_loader(dataset, batch_size):
+    """Create the Data Loader for the dataset."""
+    loader = data_utils.DataLoader(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        pin_memory=True,
+        num_workers=2,
+    )
+    return loader
+
+
+def train_batch(images, labels, model, criterion, split="training", optimizer=None):
+    """Train a batch of data."""
+    if split == "training":
+        assert optimizer is not None, "Optimizer must be provided for training"
     
-    return model, criterion, optimizer, scheduler
+    images = images.to(device=DEVICE)
+    labels = labels.to(device=DEVICE).float()
 
-def train(model, train_loader, val_loader, criterion, optimizer, scheduler, config):
-    """
-    The main training loop.
-    """
-    best_val_loss = float('inf')
-    for epoch in range(config.epochs):
-        model.train()
-        running_loss = 0.0
-        
-        print(f"\n--- Epoch {epoch+1}/{config.epochs} ---")
-        
-        for _, (images_batch, labels_batch) in enumerate(tqdm(train_loader)):
-            images_batch = images_batch.to(DEVICE)
-            labels_batch = labels_batch.to(DEVICE).float().view(-1, 1)
-            
-            optimizer.zero_grad()
-            outputs = model(images_batch)
-            loss = criterion(outputs, labels_batch)
-            loss.backward()
-            optimizer.step()
-            
-            running_loss += loss.item() * images_batch.size(0)
-        
-        epoch_loss = running_loss / len(train_loader.dataset)
-        
-        # Validation phase
-        model.eval()
-        val_loss = 0.0
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for images_batch, labels_batch in tqdm(val_loader):
-                images_batch = images_batch.to(DEVICE)
-                labels_batch = labels_batch.to(DEVICE).float().view(-1, 1)
-                
-                outputs = model(images_batch)
-                loss = criterion(outputs, labels_batch)
-                val_loss += loss.item() * images_batch.size(0)
-                
-                predicted = torch.sigmoid(outputs) > 0.5
-                total += labels_batch.size(0)
-                correct += (predicted == (labels_batch > 0.5)).sum().item()
+    # Forward pass
+    outputs = model(images).squeeze()
 
-        val_epoch_loss = val_loss / len(val_loader.dataset)
-        accuracy = 100 * correct / total
-        
-        print(f"Epoch {epoch+1}, Train Loss: {epoch_loss:.4f}, Val Loss: {val_epoch_loss:.4f}, Accuracy: {accuracy:.2f}%")
-        
-        # Step the scheduler with the validation loss
-        scheduler.step(val_epoch_loss)
-        
-        wandb.log({"epoch": epoch+1, "train_loss": epoch_loss, "val_loss": val_epoch_loss, "accuracy": accuracy, "learning_rate": optimizer.param_groups[0]['lr']})
-        
-        if val_epoch_loss < best_val_loss:
-            best_val_loss = val_epoch_loss
-            if not os.path.exists(CHECKPOINT_PATH):
-                os.makedirs(CHECKPOINT_PATH)
-            
-            save_path = os.path.join(CHECKPOINT_PATH, f"hybrid_cnn.pth")
-            
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': best_val_loss,
-            }, save_path)
-            print(f"Model saved to {save_path}")
+    loss = criterion(outputs, labels)
+    acc = get_accuracy(outputs, labels)
+
+    if split == "training":
+        # Backward and optimize
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    return loss.item(), acc
+
 
 def model_pipeline(hyperparameters):
-    """
-    Main pipeline to run the training process.
-    """
-    with wandb.init(project="deepfake-detection-hybrid", config=hyperparameters):
+    """Initializes and runs the training pipeline."""
+    with wandb.init(project="deepfake-detection", config=hyperparameters):
         config = wandb.config
-        print("Using the configuration from wandb.config")
-        
-        train_df, val_df = get_datasets(DATA_FOLDER)
-        train_transform, val_transform = get_transforms(IMG_WIDTH, IMG_HEIGHT)
-        
-        train_dataset = FaceDataset(DATA_FOLDER, train_df, train_transform)
-        val_dataset = FaceDataset(DATA_FOLDER, val_df, val_transform)
-        
-        train_loader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
-        val_loader = DataLoader(val_dataset, batch_size=VAL_BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
-        
-        model, criterion, optimizer, scheduler = make_model(config)
-        
-        print("Beginning training 🎨")
+        # UPDATED: Receive scheduler from make function
+        model, train_loader, val_loader, criterion, optimizer, scheduler = make(config)
+        # UPDATED: Pass scheduler to train function
         train(model, train_loader, val_loader, criterion, optimizer, scheduler, config)
-    
     return model
 
-if __name__ == "__main__":
-    hyperparameters = dict(
-        epochs=15, # Increased epochs to give scheduler time to work
-        classes=1,
-        learning_rate=0.001,
-        dataset="Faces Dataset",
-        architecture="HybridCNN-QNN-Trainable"
+
+def save_best_model(model, optimizer, loss, save_path):
+    """Saves the best model checkpoint, overwriting previous best."""
+    if not os.path.exists("./models"):
+        os.makedirs("./models")
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "validation_loss": loss,
+        },
+        save_path,
     )
+
+
+def train(model, train_loader, val_loader, criterion, optimizer, scheduler, config):
+    """Main training loop."""
+    print("Beginning training 🎨")
+    wandb.watch(model, criterion, log="all", log_freq=10)
+
+    history = {"loss": {"train": [], "val": []}, "acc": {"train": [], "val": []}}
+    batches_seen = 0
+    # ADDED: Track best validation loss
+    best_val_loss = float('inf')
+    save_path = "./models/best_resnetinceptionv1.pth"
+
+    for epoch in range(config.epochs):
+        # Training phase
+        model.train()
+        acc_per_epoch_train, loss_per_epoch_train = 0, 0
+        for images_batch, labels_batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs} [Train]"):
+            loss, acc = train_batch(
+                images_batch, labels_batch, model, criterion, "training", optimizer
+            )
+            batches_seen += 1
+            acc_per_epoch_train += acc
+            loss_per_epoch_train += loss
+
+        # Validation phase
+        model.eval()
+        acc_per_epoch_val, loss_per_epoch_val = 0, 0
+        with torch.no_grad():
+            for images_batch, labels_batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{config.epochs} [Val]"):
+                loss, acc = train_batch(
+                    images_batch, labels_batch, model, criterion, "validation"
+                )
+                acc_per_epoch_val += acc
+                loss_per_epoch_val += loss
+
+        # Calculate and store metrics for the epoch
+        train_loss = loss_per_epoch_train / len(train_loader)
+        val_loss = loss_per_epoch_val / len(val_loader)
+        train_acc = acc_per_epoch_train / len(train_loader)
+        val_acc = acc_per_epoch_val / len(val_loader)
+        
+        history["loss"]["train"].append(train_loss)
+        history["loss"]["val"].append(val_loss)
+        history["acc"]["train"].append(train_acc)
+        history["acc"]["val"].append(val_acc)
+
+        # Print epoch results
+        print(f"Epoch [{epoch + 1}/{config.epochs}]")
+        print(f"\tTrain Loss: {train_loss:.4f}, Train Acc: {train_acc*100:.2f}%")
+        print(f"\tVal Loss: {val_loss:.4f}, Val Acc: {val_acc*100:.2f}%", end="\n\n")
+
+        # UPDATED: Step the scheduler with the validation loss
+        scheduler.step(val_loss)
+
+        # Log metrics to wandb
+        wandb.log({
+            "Epoch": epoch + 1,
+            "Train Loss": train_loss,
+            "Val Loss": val_loss,
+            "Train Acc": train_acc * 100,
+            "Val Acc": val_acc * 100,
+            "Learning Rate": optimizer.param_groups[0]['lr']
+        }, step=batches_seen)
+
+        # UPDATED: Save only the best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            save_best_model(model, optimizer, best_val_loss, save_path)
+            print(f"New best model saved to {save_path} with validation loss: {best_val_loss:.4f}")
+
+
+if __name__ == "__main__":
+    print(f"Running on device: {DEVICE.upper()}")
+
+    # Hyperparameters for the training run
+    config = dict(
+        # UPDATED: Epochs set to 15
+        epochs=15,
+        classes=1,
+        batch_size=16,
+        learning_rate=0.001,
+        dataset="FaceForensics++",
+        architecture="InceptionResNetV1",
+        pretrained_dataset="vggface2"
+    )
+
+    # Start the pipeline
+    model = model_pipeline(config)
     
-    model = model_pipeline(hyperparameters)
+    print("Training finished.")
