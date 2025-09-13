@@ -5,19 +5,49 @@ from torch import nn
 from torch import optim
 from facenet_pytorch import InceptionResnetV1
 from tqdm import tqdm
-from random import randint
-import matplotlib.pyplot as plt
+import pandas as pd
+from sklearn.model_selection import train_test_split
 import wandb
+# NEW IMPORTS for image transformation
+import albumentations
+from albumentations.pytorch import ToTensorV2
 from utils.denormalize_image import denormalize_image
 from utils.metrics import get_accuracy
 from utils.dict_to_struct import DictStructure
-from dataset.faces import Faces
-import numpy as np # <--- CHANGE: Added for np.inf
+from dataset.faces import FaceDataset
 
-FACES_FOLDER = os.path.join("data", "faces")
-FACES_CSV = os.path.join(FACES_FOLDER, "faces.csv")
+# --- Constants ---
+DATA_ROOT = "data" 
+FACES_CSV = os.path.join(DATA_ROOT, "faces", "faces.csv")
 VALIDATION_SPLIT = 0.2
+IMG_WIDTH = 224 # Standard size for InceptionResnetV1
+IMG_HEIGHT = 224
 CLASS_NAMES = {0: "real", 1: "fake"}
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+
+def get_transforms(img_width, img_height):
+    """
+    Defines the image augmentation and transformation pipelines.
+    """
+    train_transform = albumentations.Compose([
+        albumentations.Resize(img_width, img_height),
+        albumentations.HorizontalFlip(p=0.5),
+        albumentations.Affine(
+            scale=(0.95, 1.05),
+            translate_percent=(-0.05, 0.05),
+            rotate=(-15, 15),
+            p=0.5
+        ),
+        albumentations.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ToTensorV2(),
+    ])
+    val_transform = albumentations.Compose([
+        albumentations.Resize(img_width, img_height),
+        albumentations.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ToTensorV2(),
+    ])
+    return train_transform, val_transform
 
 
 def make(config):
@@ -30,72 +60,42 @@ def make(config):
     else:
         raise ValueError("config must be a wandb.Config or a dict")
 
-    # Make the data
-    train_dataset = get_data(split="training", transform=True, print_ds_len=True)
-    val_dataset = get_data(split="validation", transform=True, print_ds_len=False)
+    # --- Data Preparation ---
+    faces_df = pd.read_csv(FACES_CSV)
+    print(f"Original dataset length: {len(faces_df)}")
+
+    train_df, val_df = train_test_split(
+        faces_df, 
+        test_size=VALIDATION_SPLIT, 
+        random_state=42, 
+        stratify=faces_df["label"]
+    )
+    print(f"Training dataset length: {len(train_df)}")
+    print(f"Validation dataset length: {len(val_df)}")
+
+    train_transform, val_transform = get_transforms(IMG_WIDTH, IMG_HEIGHT)
+    
+    train_dataset = FaceDataset(DATA_ROOT, train_df, transform=train_transform)
+    val_dataset = FaceDataset(DATA_ROOT, val_df, transform=val_transform)
+
     train_loader = make_loader(train_dataset, batch_size=config.batch_size)
     val_loader = make_loader(val_dataset, batch_size=config.batch_size)
-
-    # Make the model
+    
+    # --- Model, Loss, and Optimizer ---
     model = InceptionResnetV1(
         pretrained=config.pretrained_dataset,
         classify=True,
         num_classes=config.classes,
-        dropout_prob=config.dropout_prob, # <--- CHANGE: Added dropout for regularization
         device=DEVICE,
     )
 
-    # Make the loss and optimizer
-    criterion = nn.BCEWithLogitsLoss()  # sigmoid + binary cross entropy
-    # <--- CHANGE: Added weight_decay for L2 regularization
-    optimizer = optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-
-    return model, train_loader, val_loader, criterion, optimizer
-
-
-def get_data(
-    split: str = "training", transform: bool = True, print_ds_len: bool = None
-):
-    """Get the dataset.
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
     
-    Args:
-        split (str): Split of the dataset to use: 'training' or 'validation'
-        transform (bool, optional): Perform transformations on the data or not
-        print_ds_len (bool, optional): Print the length of the original dataset
-    """
-    # Check that the arguments are as expected
-    assert split in [
-        "training",
-        "validation",
-    ], "Split must be 'training' or 'validation'"
-    assert transform in [True, False], "Transform must be True or False"
+    # ADDED: Learning rate scheduler to prevent overfitting
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.1, patience=2)
 
-    # Create the dataset
-    full_dataset = Faces(
-        root=FACES_FOLDER, csv=FACES_CSV, split=split, transform=transform
-    )
-    if print_ds_len:
-        print(f"Original dataset length: {len(full_dataset)}")
-
-    # Set where the subsets should start and end
-    end_idx = (
-        round((1 - VALIDATION_SPLIT) * len(full_dataset))
-        if split == "training"
-        else len(full_dataset)
-    )
-    begin_idx = (
-        0 if split == "training" else round((1 - VALIDATION_SPLIT) * len(full_dataset))
-    )
-
-    # Create the subsets
-    subset_indices = torch.arange(begin_idx, end_idx)
-    subset_dataset = data_utils.Subset(full_dataset, subset_indices)
-
-    print(
-        f"{split} dataset length ({round(len(subset_dataset) / len(full_dataset), 2)*100}%): {len(subset_dataset)}"
-    )
-
-    return subset_dataset
+    return model, train_loader, val_loader, criterion, optimizer, scheduler
 
 
 def make_loader(dataset, batch_size):
@@ -114,13 +114,9 @@ def train_batch(images, labels, model, criterion, split="training", optimizer=No
     """Train a batch of data."""
     if split == "training":
         assert optimizer is not None, "Optimizer must be provided for training"
-    assert split in [
-        "training",
-        "validation",
-    ], "Split must be 'training' or 'validation'"
-
+    
     images = images.to(device=DEVICE)
-    labels = labels.to(device=DEVICE)
+    labels = labels.to(device=DEVICE).float()
 
     # Forward pass
     outputs = model(images).squeeze()
@@ -138,133 +134,116 @@ def train_batch(images, labels, model, criterion, split="training", optimizer=No
 
 
 def model_pipeline(hyperparameters):
-    # tell wandb to get started
+    """Initializes and runs the training pipeline."""
     with wandb.init(project="deepfake-detection", config=hyperparameters):
-        # access all HPs through wandb.config, so logging matches execution!
         config = wandb.config
-
-        # make the model, data, and optimization problem
-        model, train_loader, val_loader, criterion, optimizer = make(config)
-
-        # and use them to train the model
-        train(model, train_loader, val_loader, criterion, optimizer, config)
-
-    # <--- CHANGE: Load the best model's state before returning
-    print("Training finished. Loading best model...")
-    model.load_state_dict(torch.load("./models/resnetinceptionv1_best.pth"))
-    
+        # UPDATED: Receive scheduler from make function
+        model, train_loader, val_loader, criterion, optimizer, scheduler = make(config)
+        # UPDATED: Pass scheduler to train function
+        train(model, train_loader, val_loader, criterion, optimizer, scheduler, config)
     return model
 
 
-def train(model, train_loader, val_loader, criterion, optimizer, config):
-    """Train the model and save the information on Weights and Biases."""
+def save_best_model(model, optimizer, loss, save_path):
+    """Saves the best model checkpoint, overwriting previous best."""
+    if not os.path.exists("./models"):
+        os.makedirs("./models")
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "validation_loss": loss,
+        },
+        save_path,
+    )
+
+
+def train(model, train_loader, val_loader, criterion, optimizer, scheduler, config):
+    """Main training loop."""
     print("Beginning training 🎨")
     wandb.watch(model, criterion, log="all", log_freq=10)
 
-    # <--- CHANGE: Variables for tracking the best model and early stopping
-    best_val_loss = np.inf
-    epochs_no_improve = 0
-    
     history = {"loss": {"train": [], "val": []}, "acc": {"train": [], "val": []}}
     batches_seen = 0
-    base_path = "./models"
-    # Create the directory if it doesn't exist
-    os.makedirs(base_path, exist_ok=True)
-    best_model_path = os.path.join(base_path, "resnetinceptionv1_best.pth")
+    # ADDED: Track best validation loss
+    best_val_loss = float('inf')
+    save_path = "./models/best_resnetinceptionv1.pth"
 
     for epoch in range(config.epochs):
-        # Training
-        acc_per_epoch_train, loss_per_epoch_train = 0, 0
+        # Training phase
         model.train()
-        for _, (images_batch, labels_batch) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]")):
+        acc_per_epoch_train, loss_per_epoch_train = 0, 0
+        for images_batch, labels_batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs} [Train]"):
             loss, acc = train_batch(
                 images_batch, labels_batch, model, criterion, "training", optimizer
             )
-
             batches_seen += 1
             acc_per_epoch_train += acc
             loss_per_epoch_train += loss
 
-        # Validation
+        # Validation phase
+        model.eval()
+        acc_per_epoch_val, loss_per_epoch_val = 0, 0
         with torch.no_grad():
-            acc_per_epoch_val, loss_per_epoch_val = 0, 0
-            model.eval()
-            for _, (images_batch, labels_batch) in enumerate(tqdm(val_loader, desc=f"Epoch {epoch+1} [Val]")):
+            for images_batch, labels_batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{config.epochs} [Val]"):
                 loss, acc = train_batch(
                     images_batch, labels_batch, model, criterion, "validation"
                 )
-
                 acc_per_epoch_val += acc
                 loss_per_epoch_val += loss
 
-        # Calculate average loss and accuracy for the epoch
-        avg_train_loss = loss_per_epoch_train / len(train_loader)
-        avg_val_loss = loss_per_epoch_val / len(val_loader)
-        avg_train_acc = acc_per_epoch_train / len(train_loader)
-        avg_val_acc = acc_per_epoch_val / len(val_loader)
-
-        history["loss"]["train"].append(avg_train_loss)
-        history["loss"]["val"].append(avg_val_loss)
-        history["acc"]["train"].append(avg_train_acc)
-        history["acc"]["val"].append(avg_val_acc)
-
-        print(f"Epoch [{epoch + 1}/{config.epochs}]")
-        print(
-            f"\tTrain Loss: {avg_train_loss:.4f}, Train Acc: {avg_train_acc*100:.2f}%"
-        )
-        print(
-            f"\tVal Loss: {avg_val_loss:.4f}, Val Acc: {avg_val_acc*100:.2f}%",
-            end="\n",
-        )
-
-        wandb.log(
-            {
-                "Epoch": epoch + 1,
-                "Train Loss": avg_train_loss,
-                "Val Loss": avg_val_loss,
-                "Train Acc": round(avg_train_acc * 100, 2),
-                "Val Acc": round(avg_val_acc * 100, 2),
-            },
-            step=batches_seen,
-        )
-
-        # <--- CHANGE: Save the best model and check for early stopping
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), best_model_path)
-            print(f"\t✨ New best model saved with validation loss: {best_val_loss:.4f}")
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
-            print(f"\tValidation loss did not improve for {epochs_no_improve} epoch(s).")
+        # Calculate and store metrics for the epoch
+        train_loss = loss_per_epoch_train / len(train_loader)
+        val_loss = loss_per_epoch_val / len(val_loader)
+        train_acc = acc_per_epoch_train / len(train_loader)
+        val_acc = acc_per_epoch_val / len(val_loader)
         
-        if epochs_no_improve >= config.patience:
-            print(f"\nEarly stopping triggered after {epoch + 1} epochs.")
-            break
-        print("-" * 30)
+        history["loss"]["train"].append(train_loss)
+        history["loss"]["val"].append(val_loss)
+        history["acc"]["train"].append(train_acc)
+        history["acc"]["val"].append(val_acc)
+
+        # Print epoch results
+        print(f"Epoch [{epoch + 1}/{config.epochs}]")
+        print(f"\tTrain Loss: {train_loss:.4f}, Train Acc: {train_acc*100:.2f}%")
+        print(f"\tVal Loss: {val_loss:.4f}, Val Acc: {val_acc*100:.2f}%", end="\n\n")
+
+        # UPDATED: Step the scheduler with the validation loss
+        scheduler.step(val_loss)
+
+        # Log metrics to wandb
+        wandb.log({
+            "Epoch": epoch + 1,
+            "Train Loss": train_loss,
+            "Val Loss": val_loss,
+            "Train Acc": train_acc * 100,
+            "Val Acc": val_acc * 100,
+            "Learning Rate": optimizer.param_groups[0]['lr']
+        }, step=batches_seen)
+
+        # UPDATED: Save only the best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            save_best_model(model, optimizer, best_val_loss, save_path)
+            print(f"New best model saved to {save_path} with validation loss: {best_val_loss:.4f}")
+
 
 if __name__ == "__main__":
-    DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
     print(f"Running on device: {DEVICE.upper()}")
 
+    # Hyperparameters for the training run
     config = dict(
-        # --- Training settings ---
-        epochs=15,                 # <--- CHANGE: Set to 15 epochs
+        # UPDATED: Epochs set to 15
+        epochs=15,
+        classes=1,
         batch_size=16,
         learning_rate=0.001,
-        
-        # --- Model architecture ---
-        classes=1,
+        dataset="FaceForensics++",
         architecture="InceptionResNetV1",
-        pretrained_dataset="vggface2",
-        
-        # --- Anti-overfitting measures ---
-        weight_decay=1e-4,         # <--- CHANGE: L2 regularization
-        dropout_prob=0.4,          # <--- CHANGE: Dropout rate
-        patience=3,                # <--- CHANGE: Early stopping patience
+        pretrained_dataset="vggface2"
     )
 
+    # Start the pipeline
     model = model_pipeline(config)
-    # <--- CHANGE: The final saved model is now the best one from training
-    torch.save(model.state_dict(), "./models/resnetinceptionv1_final_best.pth")
-    print("\n✅ Final best model saved to ./models/resnetinceptionv1_final_best.pth")
+    
+    print("Training finished.")

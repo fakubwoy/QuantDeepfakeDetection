@@ -2,7 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+.gradio
 # C extensions
 *.so
 old_torch_venv

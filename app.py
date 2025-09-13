@@ -446,7 +446,7 @@ with gr.Blocks(css=modern_css, theme=gr.themes.Base()) as demo:
     # Header Section
     with gr.Row():
         with gr.Column():
-            gr.Markdown("# 🔬 AI Deepfake Detector")
+            gr.Markdown("#Deepfake Detector")
             gr.Markdown("Advanced neural network analysis using quantum-classical hybrid and traditional CNN architectures")
     
     # Main Interface

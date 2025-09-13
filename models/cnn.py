@@ -1,72 +1,114 @@
 import torch
 import torch.nn as nn
+from torchvision import models
+from facenet_pytorch import InceptionResnetV1
 
 # Qiskit Imports
 from qiskit import QuantumCircuit
-from qiskit.circuit.library import ZZFeatureMap, RealAmplitudes # Added RealAmplitudes
+from qiskit.circuit.library import ZZFeatureMap, RealAmplitudes
 from qiskit_machine_learning.neural_networks import EstimatorQNN
 from qiskit_machine_learning.connectors import TorchConnector
 
-class HybridCNN(nn.Module):
+class ImprovedHybridQNN(nn.Module):
     """
-    Hybrid Quantum-Classical Convolutional Neural Network.
+    An improved Hybrid Quantum-Classical Network that:
+    1. Uses a powerful, pre-trained InceptionResnetV1 as the feature extractor.
+    2. Implements gradual feature reduction to avoid information loss.
+    3. Utilizes a more expressive quantum circuit.
     """
-    def __init__(self, num_qubits=4, num_classes=1):
-        super(HybridCNN, self).__init__()
-        
-        # --- Classical Part ---
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=8, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(8)
-        self.relu1 = nn.ReLU()
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
-        
-        self.conv2 = nn.Conv2d(in_channels=8, out_channels=16, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(16)
-        self.relu2 = nn.ReLU()
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
-        
-        self.feature_reducer = nn.Linear(16 * 64 * 64, num_qubits)
-        self.relu3 = nn.ReLU()
+    def __init__(self, num_qubits=8, reps=2, num_classes=1, freeze_feature_extractor=True):
+        super(ImprovedHybridQNN, self).__init__()
 
-        # --- Quantum Part ---
-        # 1. Encode the classical data using ZZFeatureMap
-        feature_map = ZZFeatureMap(feature_dimension=num_qubits, reps=1)
+        # --- 1. Use InceptionResnetV1 properly ---
+        self.feature_extractor = InceptionResnetV1(pretrained='vggface2', classify=False)
+
+        # Freeze the parameters of the feature extractor
+        if freeze_feature_extractor:
+            for param in self.feature_extractor.parameters():
+                param.requires_grad = False
         
-        # 2. Add a trainable quantum circuit (ansatz) to act as a neural network layer
-        ansatz = RealAmplitudes(num_qubits, reps=1)
+        # --- 2. InceptionResnetV1 with classify=False outputs 512 features ---
+        num_ftrs = 512
+
+        # --- 3. Gradual Feature Reduction ---
+        self.feature_reducer = nn.Sequential(
+            nn.Linear(num_ftrs, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, num_qubits),
+            nn.Tanh()
+        )
         
-        # 3. Combine them into a single circuit
+        # --- 4. More Expressive Quantum Part ---
+        feature_map = ZZFeatureMap(feature_dimension=num_qubits, reps=reps)
+        ansatz = RealAmplitudes(num_qubits, reps=reps)
+
         qc = QuantumCircuit(num_qubits)
         qc.compose(feature_map, inplace=True)
         qc.compose(ansatz, inplace=True)
 
-        # 4. Wrap the circuit in a QNN, specifying which parameters are for input and which are trainable weights
         qnn = EstimatorQNN(
             circuit=qc,
             input_params=feature_map.parameters,
-            weight_params=ansatz.parameters  # These are now trainable weights
+            weight_params=ansatz.parameters
         )
 
-        # 5. Wrap the QNN in a TorchConnector
         self.q_layer = TorchConnector(qnn)
-        
-        # Final classical layer to map the single quantum output to the desired class format
+
+        # Final classical layer to map QNN output to the number of classes
         self.final_fc = nn.Linear(1, num_classes)
 
     def forward(self, x):
-        # --- Classical Feature Extraction ---
-        x = self.pool1(self.relu1(self.bn1(self.conv1(x))))
-        x = self.pool2(self.relu2(self.bn2(self.conv2(x))))
-        
-        x = x.reshape(x.shape[0], -1)
-        
-        # --- Bottleneck ---
-        x = self.relu3(self.feature_reducer(x))
-        
+        # --- FIXED: Use the feature extractor without torch.no_grad() ---
+        # The layers are already frozen, so gradients won't be computed for them
+        # during training. Removing the no_grad() context allows tools like
+        # Grad-CAM to function correctly during evaluation.
+        x = self.feature_extractor(x)
+
+        # --- Gradual Reduction ---
+        x = self.feature_reducer(x)
+
         # --- Quantum Processing ---
         x = self.q_layer(x)
-        
+
         # --- Final Classification ---
         x = self.final_fc(x)
+        return x
 
+
+# Keep the old class for reference
+class HybridResnetQNN(nn.Module):
+    """
+    Hybrid Quantum-Classical Network using a pre-trained ResNet18 as a feature extractor.
+    """
+    def __init__(self, num_qubits=4, num_classes=1, freeze_feature_extractor=True):
+        super(HybridResnetQNN, self).__init__()
+        self.feature_extractor = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        if freeze_feature_extractor:
+            for param in self.feature_extractor.parameters():
+                param.requires_grad = False
+        num_ftrs = self.feature_extractor.fc.in_features
+        self.feature_extractor.fc = nn.Linear(num_ftrs, num_qubits)
+        self.relu = nn.ReLU()
+        feature_map = ZZFeatureMap(feature_dimension=num_qubits, reps=1)
+        ansatz = RealAmplitudes(num_qubits, reps=1)
+        qc = QuantumCircuit(num_qubits)
+        qc.compose(feature_map, inplace=True)
+        qc.compose(ansatz, inplace=True)
+        qnn = EstimatorQNN(
+            circuit=qc,
+            input_params=feature_map.parameters,
+            weight_params=ansatz.parameters
+        )
+        self.q_layer = TorchConnector(qnn)
+        self.final_fc = nn.Linear(1, num_classes)
+        
+    def forward(self, x):
+        x = self.feature_extractor(x)
+        x = self.relu(x)
+        x = self.q_layer(x)
+        x = self.final_fc(x)
         return x
