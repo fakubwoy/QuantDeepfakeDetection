@@ -5,82 +5,170 @@ import pandas as pd
 import numpy as np
 import albumentations
 from tqdm import tqdm
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from albumentations.pytorch import ToTensorV2
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score, precision_recall_curve, auc, balanced_accuracy_score
+from sklearn.utils.class_weight import compute_class_weight
+from collections import Counter
+import torch.nn.functional as F
 
-# Import the enhanced quantum model
 from models.quantum_cnn import (
-    ImprovedQuantumClassifier, 
-    EnhancedQuantumLoss, 
-    perform_enhanced_quantum_feature_selection
+    BalancedQuantumClassifier, 
+    AdaptiveFocalLoss, 
+    perform_advanced_quantum_feature_selection,
+    MixupAugmentation
 )
 from dataset.faces import FaceDataset
 
-# Constants
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 DATA_FOLDER = "./data"
-TRAIN_BATCH_SIZE = 12  # Slightly smaller for better gradients
-VAL_BATCH_SIZE = 16
+TRAIN_BATCH_SIZE = 16
+VAL_BATCH_SIZE = 20
 IMG_WIDTH = 224
 IMG_HEIGHT = 224
-NUM_WORKERS = 4
+NUM_WORKERS = 6
 CHECKPOINT_PATH = "./models"
 
-def get_datasets(data_folder, val_size=0.2):
-    """Read and split the dataset with stratification."""
+def create_balanced_sampler(labels, oversample_minority=True):
+    label_counts = Counter(labels)
+    total_samples = len(labels)
+    
+    if oversample_minority:
+        max_count = max(label_counts.values())
+        weights = {label: max_count / count for label, count in label_counts.items()}
+    else:
+        min_count = min(label_counts.values())
+        weights = {label: min_count / count for label, count in label_counts.items()}
+    
+    sample_weights = [weights[label] for label in labels]
+    
+    return WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=total_samples if not oversample_minority else max(label_counts.values()) * len(label_counts),
+        replacement=True
+    )
+
+def get_stratified_datasets(data_folder, val_size=0.15, n_folds=1):
     faces_csv = os.path.join(data_folder, "faces", "faces.csv")
     faces_df = pd.read_csv(faces_csv)
-    print(f"Original dataset length: {len(faces_df)}")
     
-    # Check class distribution
-    class_counts = faces_df['label'].value_counts()
-    print(f"Class distribution: {dict(class_counts)}")
+    print(f"Dataset size: {len(faces_df)}")
+    class_dist = faces_df['label'].value_counts().to_dict()
+    print(f"Original distribution: {class_dist}")
+    imbalance_ratio = max(class_dist.values()) / min(class_dist.values())
+    print(f"Imbalance ratio: {imbalance_ratio:.1f}:1")
     
-    train_df, val_df = train_test_split(
-        faces_df, test_size=val_size, random_state=42, stratify=faces_df["label"]
-    )
-    print(f"Training dataset length ({1-val_size:.1%}): {len(train_df)}")
-    print(f"Validation dataset length ({val_size:.1%}): {len(val_df)}")
-    
-    return train_df, val_df
+    if n_folds == 1:
+        skf = StratifiedKFold(n_splits=int(1/val_size), shuffle=True, random_state=42)
+        train_idx, val_idx = next(skf.split(faces_df, faces_df['label']))
+        train_df = faces_df.iloc[train_idx].reset_index(drop=True)
+        val_df = faces_df.iloc[val_idx].reset_index(drop=True)
+        return [(train_df, val_df)]
+    else:
+        skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+        folds = []
+        for train_idx, val_idx in skf.split(faces_df, faces_df['label']):
+            train_df = faces_df.iloc[train_idx].reset_index(drop=True)
+            val_df = faces_df.iloc[val_idx].reset_index(drop=True)
+            folds.append((train_df, val_df))
+        return folds
 
-def get_enhanced_transforms(img_width, img_height):
-    """Enhanced transformations with better augmentation."""
-    train_transform = albumentations.Compose([
+def get_advanced_transforms(img_width, img_height, is_real_heavy=False):
+    base_transforms = [
         albumentations.Resize(img_width, img_height),
+        albumentations.RandomResizedCrop((img_height, img_width), scale=(0.85, 1.0), ratio=(0.9, 1.1), p=0.5),
+    ]
+    
+    real_augmentations = [
         albumentations.OneOf([
             albumentations.HorizontalFlip(p=1.0),
-            albumentations.VerticalFlip(p=0.1),
-            albumentations.RandomRotate90(p=0.1),
-        ], p=0.5),
+            albumentations.VerticalFlip(p=0.3),
+            albumentations.RandomRotate90(p=0.3),
+        ], p=0.7),
+        
         albumentations.OneOf([
-            albumentations.Affine(
-                scale=(0.9, 1.1),
-                translate_percent=(-0.1, 0.1),
-                rotate=(-20, 20),
-                p=1.0
-            ),
             albumentations.ShiftScaleRotate(
-                shift_limit=0.1,
-                scale_limit=0.1,
-                rotate_limit=15,
-                p=1.0
+                shift_limit=0.15, scale_limit=0.15, rotate_limit=25, p=1.0
+            ),
+            albumentations.Affine(
+                scale=(0.85, 1.15), translate_percent=(-0.15, 0.15), 
+                rotate=(-25, 25), shear=(-10, 10), p=1.0
+            ),
+            albumentations.ElasticTransform(alpha=50, sigma=5, p=1.0),
+        ], p=0.8 if is_real_heavy else 0.6),
+        
+        albumentations.OneOf([
+            albumentations.RandomBrightnessContrast(
+                brightness_limit=0.3, contrast_limit=0.3, p=1.0
+            ),
+            albumentations.HueSaturationValue(
+                hue_shift_limit=15, sat_shift_limit=20, val_shift_limit=15, p=1.0
+            ),
+            albumentations.ColorJitter(
+                brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=1.0
             ),
         ], p=0.6),
+        
         albumentations.OneOf([
-            albumentations.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=1.0),
-            albumentations.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=15, val_shift_limit=10, p=1.0),
+            albumentations.GaussianBlur(blur_limit=(1, 5), p=1.0),
+            albumentations.MedianBlur(blur_limit=5, p=1.0),
+            albumentations.MotionBlur(blur_limit=5, p=1.0),
         ], p=0.4),
+        
         albumentations.OneOf([
-            albumentations.GaussianBlur(blur_limit=(1, 3), p=1.0),
-            albumentations.MedianBlur(blur_limit=3, p=1.0),
+            albumentations.GaussNoise(var_limit=(15, 75), p=1.0),
+            albumentations.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.5), p=1.0),
+            albumentations.MultiplicativeNoise(multiplier=[0.9, 1.1], p=1.0),
+        ], p=0.3),
+        
+        albumentations.OneOf([
+            albumentations.Cutout(num_holes=3, max_h_size=16, max_w_size=16, p=1.0),
+            albumentations.CoarseDropout(
+                max_holes=5, max_height=20, max_width=20, 
+                min_holes=1, min_height=8, min_width=8, p=1.0
+            ),
         ], p=0.2),
-        albumentations.GaussNoise(var_limit=(10, 50), p=0.2),
-        albumentations.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ToTensorV2(),
-    ])
+    ]
+    
+    if is_real_heavy:
+        train_transform = albumentations.Compose(
+            base_transforms + real_augmentations + [
+                albumentations.OneOf([
+                    albumentations.GridDistortion(num_steps=5, distort_limit=0.1, p=1.0),
+                    albumentations.OpticalDistortion(distort_limit=0.1, shift_limit=0.1, p=1.0),
+                ], p=0.3),
+                albumentations.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+                ToTensorV2(),
+            ]
+        )
+    else:
+        standard_augmentations = [
+            albumentations.OneOf([
+                albumentations.HorizontalFlip(p=1.0),
+                albumentations.RandomRotate90(p=0.2),
+            ], p=0.5),
+            
+            albumentations.ShiftScaleRotate(
+                shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5
+            ),
+            
+            albumentations.RandomBrightnessContrast(
+                brightness_limit=0.2, contrast_limit=0.2, p=0.4
+            ),
+            
+            albumentations.OneOf([
+                albumentations.GaussianBlur(blur_limit=(1, 3), p=1.0),
+                albumentations.GaussNoise(var_limit=(10, 50), p=1.0),
+            ], p=0.2),
+        ]
+        
+        train_transform = albumentations.Compose(
+            base_transforms + standard_augmentations + [
+                albumentations.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+                ToTensorV2(),
+            ]
+        )
     
     val_transform = albumentations.Compose([
         albumentations.Resize(img_width, img_height),
@@ -90,25 +178,41 @@ def get_enhanced_transforms(img_width, img_height):
     
     return train_transform, val_transform
 
-def extract_features_for_selection(model, dataloader, device, max_samples=2000):
-    """
-    Extract features with balanced sampling for better feature selection.
-    """
+class BalancedFaceDataset(FaceDataset):
+    def __init__(self, data_folder, dataframe, transform=None, augment_real=False):
+        super().__init__(data_folder, dataframe, transform)
+        self.augment_real = augment_real
+        self.real_indices = dataframe[dataframe['label'] == 1].index.tolist()
+        self.fake_indices = dataframe[dataframe['label'] == 0].index.tolist()
+        
+        if augment_real:
+            real_heavy_transform, _ = get_advanced_transforms(224, 224, is_real_heavy=True)
+            self.real_heavy_transform = real_heavy_transform
+    
+    def __getitem__(self, idx):
+        if self.augment_real and idx in self.real_indices and np.random.random() < 0.4:
+            image = self.load_image(idx)
+            if self.real_heavy_transform:
+                image = self.real_heavy_transform(image=np.array(image))['image']
+            return image, self.dataframe.iloc[idx]['label']
+        else:
+            return super().__getitem__(idx)
+
+def extract_balanced_features(model, dataloader, device, max_samples=3000):
     model.eval()
     all_features = []
     all_labels = []
-    samples_per_class = {0: 0, 1: 0}  # Track samples per class
+    samples_per_class = {0: 0, 1: 0}
     max_per_class = max_samples // 2
     
     with torch.no_grad():
-        for batch_idx, (images, labels) in enumerate(dataloader):
+        for images, labels in dataloader:
             if all(samples_per_class[k] >= max_per_class for k in samples_per_class):
                 break
                 
             images = images.to(device)
             labels = labels.to(device)
             
-            # Filter to maintain class balance
             keep_indices = []
             for i, label in enumerate(labels):
                 label_val = int(label.item())
@@ -119,112 +223,110 @@ def extract_features_for_selection(model, dataloader, device, max_samples=2000):
             if not keep_indices:
                 continue
             
-            # Extract features for selected samples
             selected_images = images[keep_indices]
             selected_labels = labels[keep_indices]
             
             features = model.backbone(selected_images)
-            
             all_features.append(features.cpu())
             all_labels.append(selected_labels.cpu())
     
     features_tensor = torch.cat(all_features, dim=0)
     labels_tensor = torch.cat(all_labels, dim=0)
     
-    print(f"Feature extraction completed: {features_tensor.shape[0]} samples")
-    print(f"Class distribution in features: {torch.bincount(labels_tensor.long())}")
+    print(f"Balanced feature extraction: {features_tensor.shape[0]} samples")
+    print(f"Class distribution: {torch.bincount(labels_tensor.long())}")
     
     return features_tensor, labels_tensor
 
-def make_enhanced_model(config, selected_features=None):
-    """Create the enhanced quantum model with improved optimizer."""
-    model = ImprovedQuantumClassifier(
+def create_advanced_model(config, selected_features=None):
+    model = BalancedQuantumClassifier(
         num_classes=config.classes,
         selected_features=selected_features,
-        freeze_backbone=config.freeze_backbone
+        freeze_backbone=config.freeze_backbone,
+        dropout=config.dropout
     ).to(DEVICE)
     
-    # Enhanced loss function
-    criterion = EnhancedQuantumLoss(
+    criterion = AdaptiveFocalLoss(
+        alpha=config.focal_alpha,
+        gamma=config.focal_gamma,
+        pos_weight=config.pos_weight,
         uncertainty_weight=config.uncertainty_weight,
-        confidence_weight=config.confidence_weight
+        smoothing=config.label_smoothing
     )
     
-    # Improved optimizer setup
-    backbone_params = []
-    attention_params = []
-    classifier_params = []
+    param_groups = [
+        {'params': [p for n, p in model.named_parameters() if 'backbone' in n], 
+         'lr': config.learning_rate * 0.1, 'weight_decay': 1e-4},
+        {'params': [p for n, p in model.named_parameters() if 'quantum_attention' in n], 
+         'lr': config.learning_rate * 0.7, 'weight_decay': 1e-5},
+        {'params': [p for n, p in model.named_parameters() if 'backbone' not in n and 'quantum_attention' not in n], 
+         'lr': config.learning_rate, 'weight_decay': 5e-4}
+    ]
     
-    for name, param in model.named_parameters():
-        if 'backbone' in name:
-            backbone_params.append(param)
-        elif 'quantum_attention' in name:
-            attention_params.append(param)
-        else:
-            classifier_params.append(param)
+    optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.999), eps=1e-8)
     
-    # Different learning rates for different components
-    optimizer = torch.optim.AdamW([
-        {'params': backbone_params, 'lr': config.learning_rate * 0.05, 'weight_decay': 1e-4},
-        {'params': attention_params, 'lr': config.learning_rate * 0.5, 'weight_decay': 1e-5},
-        {'params': classifier_params, 'lr': config.learning_rate, 'weight_decay': 1e-4}
-    ])
-    
-    # Cosine annealing scheduler with warm restarts
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=5, T_mult=2, eta_min=1e-7
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=config.learning_rate,
+        steps_per_epoch=config.steps_per_epoch,
+        epochs=config.epochs,
+        pct_start=0.1,
+        div_factor=25.0,
+        final_div_factor=100.0
     )
     
     return model, criterion, optimizer, scheduler
 
-def calculate_enhanced_metrics(outputs, labels, confidences=None):
-    """Calculate comprehensive metrics including confidence calibration."""
+def compute_comprehensive_metrics(outputs, labels, confidences=None):
     with torch.no_grad():
         probabilities = torch.sigmoid(outputs)
         predictions = probabilities > 0.5
-        labels_bool = labels > 0.5
+        labels_bool = labels.bool()
         
-        # Basic metrics
-        correct = (predictions == labels_bool).sum().item()
+        correct = (predictions.squeeze() == labels_bool.squeeze()).sum().item()
         total = labels.size(0)
         accuracy = correct / total
         
-        # Calculate precision, recall, F1
-        tp = ((predictions == True) & (labels_bool == True)).sum().item()
-        fp = ((predictions == True) & (labels_bool == False)).sum().item()
-        fn = ((predictions == False) & (labels_bool == True)).sum().item()
+        tp = ((predictions.squeeze() == True) & (labels_bool.squeeze() == True)).sum().item()
+        fp = ((predictions.squeeze() == True) & (labels_bool.squeeze() == False)).sum().item()
+        fn = ((predictions.squeeze() == False) & (labels_bool.squeeze() == True)).sum().item()
+        tn = ((predictions.squeeze() == False) & (labels_bool.squeeze() == False)).sum().item()
         
         precision = tp / (tp + fp + 1e-8)
         recall = tp / (tp + fn + 1e-8)
+        specificity = tn / (tn + fp + 1e-8)
         f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
         
-        # AUC-ROC
+        balanced_acc = balanced_accuracy_score(labels_bool.cpu().numpy(), predictions.squeeze().cpu().numpy())
+        
         try:
             auc_roc = roc_auc_score(labels_bool.cpu().numpy(), probabilities.cpu().numpy())
+            precision_curve, recall_curve, _ = precision_recall_curve(labels_bool.cpu().numpy(), probabilities.cpu().numpy())
+            auc_pr = auc(recall_curve, precision_curve)
         except:
             auc_roc = 0.5
+            auc_pr = 0.5
         
         metrics = {
             'accuracy': accuracy,
+            'balanced_accuracy': balanced_acc,
             'precision': precision,
             'recall': recall,
+            'specificity': specificity,
             'f1_score': f1,
-            'auc_roc': auc_roc
+            'auc_roc': auc_roc,
+            'auc_pr': auc_pr
         }
         
-        # Confidence calibration metrics
         if confidences is not None:
-            correct_predictions = (predictions == labels_bool).float()
+            correct_predictions = (predictions.squeeze() == labels_bool.squeeze()).float()
             confidence_scores = confidences.squeeze()
-            
-            # Expected Calibration Error (ECE)
             ece = calculate_ece(confidence_scores.cpu().numpy(), correct_predictions.cpu().numpy())
             metrics['ece'] = ece
         
         return metrics
 
-def calculate_ece(confidences, accuracies, n_bins=10):
-    """Calculate Expected Calibration Error."""
+def calculate_ece(confidences, accuracies, n_bins=15):
     bin_boundaries = np.linspace(0, 1, n_bins + 1)
     bin_lowers = bin_boundaries[:-1]
     bin_uppers = bin_boundaries[1:]
@@ -241,53 +343,65 @@ def calculate_ece(confidences, accuracies, n_bins=10):
     
     return ece
 
-def train_epoch_enhanced(model, dataloader, criterion, optimizer, device):
-    """Enhanced training with confidence estimation."""
+def mixup_criterion(criterion, pred, y_a, y_b, lam, features=None, confidences=None):
+    loss_a = criterion(pred, y_a, features, confidences)
+    loss_b = criterion(pred, y_b, features, confidences)
+    return lam * loss_a + (1 - lam) * loss_b
+
+def train_epoch_advanced(model, dataloader, criterion, optimizer, scheduler, device, mixup_aug, use_mixup=True):
     model.train()
     running_loss = 0.0
     all_metrics = []
     
-    for images, labels in tqdm(dataloader, desc="Training"):
+    for batch_idx, (images, labels) in enumerate(tqdm(dataloader, desc="Training")):
         images = images.to(device)
         labels = labels.to(device).float().view(-1, 1)
         
-        optimizer.zero_grad()
+        if use_mixup and np.random.random() < 0.4:
+            mixed_images, y_a, y_b, lam = mixup_aug(images, labels)
+            
+            optimizer.zero_grad()
+            outputs, confidences = model(mixed_images, return_confidence=True)
+            
+            with torch.no_grad():
+                features = model.backbone(mixed_images)
+                if model.selected_features is not None:
+                    features = features[:, model.selected_features]
+            
+            loss = mixup_criterion(criterion, outputs, y_a, y_b, lam, features, confidences)
+        else:
+            optimizer.zero_grad()
+            outputs, confidences = model(images, return_confidence=True)
+            
+            with torch.no_grad():
+                features = model.backbone(images)
+                if model.selected_features is not None:
+                    features = features[:, model.selected_features]
+            
+            loss = criterion(outputs, labels, features, confidences)
         
-        # Forward pass with confidence
-        outputs, confidences = model(images, return_confidence=True)
-        
-        # Get features for loss computation
-        with torch.no_grad():
-            features = model.backbone(images)
-            if model.selected_features is not None:
-                features = features[:, model.selected_features]
-        
-        # Enhanced loss calculation
-        loss = criterion(outputs, labels, features, confidences)
-        
-        # Backward pass with gradient scaling
         loss.backward()
-        
-        # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-        
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        scheduler.step()
         
-        # Calculate metrics
-        metrics = calculate_enhanced_metrics(outputs, labels, confidences)
-        all_metrics.append(metrics)
+        if not use_mixup or np.random.random() >= 0.4:
+            metrics = compute_comprehensive_metrics(outputs, labels, confidences)
+            all_metrics.append(metrics)
+        
         running_loss += loss.item()
     
-    # Average metrics
     avg_metrics = {}
-    for key in all_metrics[0].keys():
-        avg_metrics[key] = np.mean([m[key] for m in all_metrics])
+    if all_metrics:
+        for key in all_metrics[0].keys():
+            avg_metrics[key] = np.mean([m[key] for m in all_metrics])
+    else:
+        avg_metrics = {'accuracy': 0, 'f1_score': 0, 'auc_roc': 0.5}
     
     avg_loss = running_loss / len(dataloader)
     return avg_loss, avg_metrics
 
-def validate_epoch_enhanced(model, dataloader, criterion, device):
-    """Enhanced validation with confidence estimation."""
+def validate_epoch_advanced(model, dataloader, criterion, device):
     model.eval()
     running_loss = 0.0
     all_metrics = []
@@ -299,18 +413,16 @@ def validate_epoch_enhanced(model, dataloader, criterion, device):
             
             outputs, confidences = model(images, return_confidence=True)
             
-            # Get features for loss computation
             features = model.backbone(images)
             if model.selected_features is not None:
                 features = features[:, model.selected_features]
             
             loss = criterion(outputs, labels, features, confidences)
             
-            metrics = calculate_enhanced_metrics(outputs, labels, confidences)
+            metrics = compute_comprehensive_metrics(outputs, labels, confidences)
             all_metrics.append(metrics)
             running_loss += loss.item()
     
-    # Average metrics
     avg_metrics = {}
     for key in all_metrics[0].keys():
         avg_metrics[key] = np.mean([m[key] for m in all_metrics])
@@ -318,93 +430,95 @@ def validate_epoch_enhanced(model, dataloader, criterion, device):
     avg_loss = running_loss / len(dataloader)
     return avg_loss, avg_metrics
 
-def train_enhanced(model, train_loader, val_loader, criterion, optimizer, scheduler, config):
-    """Enhanced training loop with better monitoring and early stopping."""
-    best_val_f1 = 0.0  # Use F1 score instead of loss for better balance
-    best_val_loss = float('inf')
+def train_balanced_model(model, train_loader, val_loader, criterion, optimizer, scheduler, config, mixup_aug):
+    best_f1 = 0.0
+    best_balanced_acc = 0.0
     patience_counter = 0
-    max_patience = 10
+    max_patience = 15
     
-    # Track training history
     history = {
         'train_loss': [], 'val_loss': [],
         'train_acc': [], 'val_acc': [],
+        'train_balanced_acc': [], 'val_balanced_acc': [],
         'train_f1': [], 'val_f1': [],
-        'val_auc': [], 'val_ece': []
+        'val_auc_roc': [], 'val_auc_pr': [], 'val_ece': []
     }
     
     for epoch in range(config.epochs):
-        print(f"\n--- Epoch {epoch+1}/{config.epochs} ---")
-        current_lr = optimizer.param_groups[0]['lr']
+        print(f"\n=== Epoch {epoch+1}/{config.epochs} ===")
+        current_lr = scheduler.get_last_lr()[0]
         print(f"Learning Rate: {current_lr:.2e}")
         
-        # Train
-        train_loss, train_metrics = train_epoch_enhanced(model, train_loader, criterion, optimizer, DEVICE)
+        train_loss, train_metrics = train_epoch_advanced(
+            model, train_loader, criterion, optimizer, scheduler, DEVICE, mixup_aug, 
+            use_mixup=epoch > 2
+        )
         
-        # Validate
-        val_loss, val_metrics = validate_epoch_enhanced(model, val_loader, criterion, DEVICE)
+        val_loss, val_metrics = validate_epoch_advanced(model, val_loader, criterion, DEVICE)
         
-        # Update scheduler
-        scheduler.step()
-        
-        # Store history
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
-        history['train_acc'].append(train_metrics['accuracy'])
-        history['val_acc'].append(val_metrics['accuracy'])
-        history['train_f1'].append(train_metrics['f1_score'])
-        history['val_f1'].append(val_metrics['f1_score'])
-        history['val_auc'].append(val_metrics['auc_roc'])
-        if 'ece' in val_metrics:
-            history['val_ece'].append(val_metrics['ece'])
+        history['train_acc'].append(train_metrics.get('accuracy', 0))
+        history['val_acc'].append(val_metrics.get('accuracy', 0))
+        history['train_balanced_acc'].append(train_metrics.get('balanced_accuracy', 0))
+        history['val_balanced_acc'].append(val_metrics.get('balanced_accuracy', 0))
+        history['train_f1'].append(train_metrics.get('f1_score', 0))
+        history['val_f1'].append(val_metrics.get('f1_score', 0))
+        history['val_auc_roc'].append(val_metrics.get('auc_roc', 0.5))
+        history['val_auc_pr'].append(val_metrics.get('auc_pr', 0.5))
+        history['val_ece'].append(val_metrics.get('ece', 0.5))
         
-        # Print comprehensive metrics
-        print(f"Train - Loss: {train_loss:.4f}, Acc: {train_metrics['accuracy']*100:.2f}%, "
-              f"F1: {train_metrics['f1_score']:.4f}, P: {train_metrics['precision']:.4f}, "
-              f"R: {train_metrics['recall']:.4f}")
+        print(f"Train - Loss: {train_loss:.4f}, Acc: {train_metrics.get('accuracy', 0)*100:.2f}%, "
+              f"Bal-Acc: {train_metrics.get('balanced_accuracy', 0)*100:.2f}%, F1: {train_metrics.get('f1_score', 0):.4f}")
         
-        print(f"Val   - Loss: {val_loss:.4f}, Acc: {val_metrics['accuracy']*100:.2f}%, "
-              f"F1: {val_metrics['f1_score']:.4f}, AUC: {val_metrics['auc_roc']:.4f}")
+        print(f"Val   - Loss: {val_loss:.4f}, Acc: {val_metrics.get('accuracy', 0)*100:.2f}%, "
+              f"Bal-Acc: {val_metrics.get('balanced_accuracy', 0)*100:.2f}%, F1: {val_metrics.get('f1_score', 0):.4f}")
         
-        if 'ece' in val_metrics:
-            print(f"Calibration - ECE: {val_metrics['ece']:.4f}")
+        print(f"      - AUC-ROC: {val_metrics.get('auc_roc', 0.5):.4f}, AUC-PR: {val_metrics.get('auc_pr', 0.5):.4f}, "
+              f"ECE: {val_metrics.get('ece', 0.5):.4f}")
         
-        # Log to wandb with comprehensive metrics
+        print(f"      - Precision: {val_metrics.get('precision', 0):.4f}, "
+              f"Recall: {val_metrics.get('recall', 0):.4f}, "
+              f"Specificity: {val_metrics.get('specificity', 0):.4f}")
+        
         log_dict = {
             "epoch": epoch + 1,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            "train_accuracy": train_metrics['accuracy'] * 100,
-            "val_accuracy": val_metrics['accuracy'] * 100,
-            "train_f1": train_metrics['f1_score'],
-            "val_f1": val_metrics['f1_score'],
-            "train_precision": train_metrics['precision'],
-            "val_precision": val_metrics['precision'],
-            "train_recall": train_metrics['recall'],
-            "val_recall": val_metrics['recall'],
-            "val_auc_roc": val_metrics['auc_roc'],
+            "train_loss": train_loss, "val_loss": val_loss,
+            "train_accuracy": train_metrics.get('accuracy', 0) * 100,
+            "val_accuracy": val_metrics.get('accuracy', 0) * 100,
+            "train_balanced_accuracy": train_metrics.get('balanced_accuracy', 0) * 100,
+            "val_balanced_accuracy": val_metrics.get('balanced_accuracy', 0) * 100,
+            "train_f1": train_metrics.get('f1_score', 0),
+            "val_f1": val_metrics.get('f1_score', 0),
+            "val_precision": val_metrics.get('precision', 0),
+            "val_recall": val_metrics.get('recall', 0),
+            "val_specificity": val_metrics.get('specificity', 0),
+            "val_auc_roc": val_metrics.get('auc_roc', 0.5),
+            "val_auc_pr": val_metrics.get('auc_pr', 0.5),
+            "val_ece": val_metrics.get('ece', 0.5),
             "learning_rate": current_lr
         }
         
-        if 'ece' in val_metrics:
-            log_dict["val_ece"] = val_metrics['ece']
-        
         wandb.log(log_dict)
         
-        # Enhanced model saving strategy
+        current_f1 = val_metrics.get('f1_score', 0)
+        current_balanced_acc = val_metrics.get('balanced_accuracy', 0)
+        
         improved = False
+        save_reason = ""
         
-        # Primary criterion: F1 score (better balance between precision and recall)
-        if val_metrics['f1_score'] > best_val_f1:
-            best_val_f1 = val_metrics['f1_score']
+        if current_f1 > best_f1 + 0.005:
+            best_f1 = current_f1
             improved = True
-            save_suffix = "best_f1"
-        
-        # Secondary criterion: Loss (if F1 is close)
-        elif abs(val_metrics['f1_score'] - best_val_f1) < 0.01 and val_loss < best_val_loss:
-            best_val_loss = val_loss
+            save_reason = "best_f1"
+        elif current_balanced_acc > best_balanced_acc + 0.005:
+            best_balanced_acc = current_balanced_acc
             improved = True
-            save_suffix = "best_loss"
+            save_reason = "best_balanced_acc"
+        elif abs(current_f1 - best_f1) < 0.01 and current_balanced_acc > best_balanced_acc:
+            best_balanced_acc = current_balanced_acc
+            improved = True
+            save_reason = "best_balanced_acc_close"
         
         if improved:
             patience_counter = 0
@@ -412,7 +526,7 @@ def train_enhanced(model, train_loader, val_loader, criterion, optimizer, schedu
             if not os.path.exists(CHECKPOINT_PATH):
                 os.makedirs(CHECKPOINT_PATH)
             
-            save_path = os.path.join(CHECKPOINT_PATH, f"enhanced_quantum_model_{save_suffix}.pth")
+            save_path = os.path.join(CHECKPOINT_PATH, f"advanced_quantum_model_{save_reason}.pth")
             
             torch.save({
                 'epoch': epoch,
@@ -420,63 +534,38 @@ def train_enhanced(model, train_loader, val_loader, criterion, optimizer, schedu
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': val_loss,
-                'train_acc': train_metrics['accuracy'],
-                'val_acc': val_metrics['accuracy'],
-                'val_f1': val_metrics['f1_score'],
-                'val_auc': val_metrics['auc_roc'],
+                'metrics': val_metrics,
                 'selected_features': model.selected_features,
                 'config': dict(config),
                 'history': history
             }, save_path)
             
-            print(f"✅ New best model saved: {save_suffix} "
-                  f"(F1: {val_metrics['f1_score']:.4f}, AUC: {val_metrics['auc_roc']:.4f})")
+            print(f"Model saved: {save_reason} (F1: {current_f1:.4f}, Bal-Acc: {current_balanced_acc:.4f})")
         else:
             patience_counter += 1
             
-        # Early stopping with extended patience for quantum models
         if patience_counter >= max_patience:
             print(f"Early stopping after {max_patience} epochs without improvement")
             break
-        
-        # Learning rate monitoring
-        if current_lr < 1e-7:
-            print("Learning rate too small, stopping training")
-            break
-    
-    # Save final model
-    final_save_path = os.path.join(CHECKPOINT_PATH, "enhanced_quantum_model_final.pth")
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'loss': val_loss,
-        'train_acc': train_metrics['accuracy'],
-        'val_acc': val_metrics['accuracy'],
-        'val_f1': val_metrics['f1_score'],
-        'val_auc': val_metrics['auc_roc'],
-        'selected_features': model.selected_features,
-        'config': dict(config),
-        'history': history
-    }, final_save_path)
     
     return history
 
-def model_pipeline_enhanced(hyperparameters):
-    """Enhanced training pipeline with better feature selection and monitoring."""
-    with wandb.init(project="enhanced-quantum-deepfake-detection", config=hyperparameters):
+def model_pipeline_balanced(hyperparameters):
+    with wandb.init(project="balanced-quantum-deepfake-detection", config=hyperparameters):
         config = wandb.config
         
-        # Load datasets with enhanced transforms
-        train_df, val_df = get_datasets(DATA_FOLDER)
-        train_transform, val_transform = get_enhanced_transforms(IMG_WIDTH, IMG_HEIGHT)
+        dataset_folds = get_stratified_datasets(DATA_FOLDER, val_size=0.15, n_folds=1)
+        train_df, val_df = dataset_folds[0]
         
-        train_dataset = FaceDataset(DATA_FOLDER, train_df, train_transform)
-        val_dataset = FaceDataset(DATA_FOLDER, val_df, val_transform)
+        train_transform, val_transform = get_advanced_transforms(IMG_WIDTH, IMG_HEIGHT)
+        
+        train_dataset = BalancedFaceDataset(DATA_FOLDER, train_df, train_transform, augment_real=True)
+        val_dataset = BalancedFaceDataset(DATA_FOLDER, val_df, val_transform, augment_real=False)
+        
+        train_sampler = create_balanced_sampler(train_df['label'].tolist(), oversample_minority=True)
         
         train_loader = DataLoader(
-            train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True,
+            train_dataset, batch_size=TRAIN_BATCH_SIZE, sampler=train_sampler,
             num_workers=NUM_WORKERS, pin_memory=True, drop_last=True
         )
         val_loader = DataLoader(
@@ -484,22 +573,21 @@ def model_pipeline_enhanced(hyperparameters):
             num_workers=NUM_WORKERS, pin_memory=True
         )
         
-        # Step 1: Create initial model for feature extraction
-        print("🔧 Creating initial model for feature extraction...")
-        initial_model, _, _, _ = make_enhanced_model(config)
+        config.steps_per_epoch = len(train_loader)
         
-        # Step 2: Enhanced quantum feature selection
+        print("Creating initial model for feature extraction...")
+        initial_model, _, _, _ = create_advanced_model(config)
+        
         if config.use_quantum_feature_selection:
-            print("🔮 Performing enhanced quantum feature selection...")
-            features, labels = extract_features_for_selection(
-                initial_model, train_loader, DEVICE, max_samples=2000
+            print("Performing advanced quantum feature selection...")
+            features, labels = extract_balanced_features(
+                initial_model, train_loader, DEVICE, max_samples=4000
             )
             
-            selected_features = perform_enhanced_quantum_feature_selection(
+            selected_features = perform_advanced_quantum_feature_selection(
                 features, labels, num_select=config.num_selected_features
             )
             
-            # Log feature selection results
             wandb.log({
                 "total_features": features.shape[1],
                 "selected_features": len(selected_features),
@@ -507,71 +595,63 @@ def model_pipeline_enhanced(hyperparameters):
             })
         else:
             selected_features = None
-            print("⏭️ Skipping quantum feature selection")
         
-        # Step 3: Create enhanced model with selected features
-        print("🚀 Creating enhanced quantum model...")
-        model, criterion, optimizer, scheduler = make_enhanced_model(config, selected_features)
+        print("Creating advanced balanced quantum model...")
+        model, criterion, optimizer, scheduler = create_advanced_model(config, selected_features)
         model.selected_features = selected_features
         
-        # Model summary
+        mixup_aug = MixupAugmentation(alpha=0.3)
+        
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"📊 Model Statistics:")
-        print(f"   Total parameters: {total_params:,}")
-        print(f"   Trainable parameters: {trainable_params:,}")
-        print(f"   Backbone frozen: {config.freeze_backbone}")
         
+        print(f"Model Statistics:")
+        print(f"  Total parameters: {total_params:,}")
+        print(f"  Trainable parameters: {trainable_params:,}")
         if selected_features:
-            print(f"   Selected features: {len(selected_features)}/512")
-            print(f"   Feature reduction: {(1 - len(selected_features)/512)*100:.1f}%")
+            print(f"  Selected features: {len(selected_features)}/512 ({len(selected_features)/512*100:.1f}%)")
         
-        # Log model info to wandb
         wandb.log({
             "model_total_params": total_params,
-            "model_trainable_params": trainable_params,
-            "backbone_frozen": config.freeze_backbone
+            "model_trainable_params": trainable_params
         })
         
-        # Step 4: Enhanced training
-        print("🎯 Beginning enhanced quantum training...")
-        history = train_enhanced(model, train_loader, val_loader, criterion, optimizer, scheduler, config)
+        print("Starting balanced quantum training...")
+        history = train_balanced_model(model, train_loader, val_loader, criterion, optimizer, scheduler, config, mixup_aug)
         
-        # Final evaluation and logging
-        print("\n📈 Training Summary:")
-        print(f"   Best Validation F1: {max(history['val_f1']):.4f}")
-        print(f"   Best Validation AUC: {max(history['val_auc']):.4f}")
-        print(f"   Final Validation Accuracy: {history['val_acc'][-1]*100:.2f}%")
-        
-        if history['val_ece']:
-            print(f"   Final ECE (lower is better): {history['val_ece'][-1]:.4f}")
+        print("\nTraining Summary:")
+        print(f"  Best Validation F1: {max(history['val_f1']):.4f}")
+        print(f"  Best Validation Balanced Accuracy: {max(history['val_balanced_acc']):.4f}")
+        print(f"  Best Validation AUC-ROC: {max(history['val_auc_roc']):.4f}")
+        print(f"  Final ECE: {history['val_ece'][-1] if history['val_ece'] else 'N/A'}")
     
     return model, history
 
 if __name__ == "__main__":
-    # Enhanced hyperparameters for better calibration and accuracy
     hyperparameters = dict(
-        epochs=30,
+        epochs=40,
         classes=1,
-        learning_rate=0.0005,  # Slightly lower for better stability
-        freeze_backbone=True,
+        learning_rate=0.0008,
+        freeze_backbone=False,
         use_quantum_feature_selection=True,
-        num_selected_features=320,  # Increased for better representation
-        uncertainty_weight=0.003,   # Reduced for less regularization
-        confidence_weight=0.015,    # Increased for better calibration
-        dataset="Enhanced Faces Dataset",
-        architecture="Enhanced-QuantumInceptionResnetV1",
-        
-        # Additional hyperparameters
-        augmentation_strength="enhanced",
-        optimizer="AdamW",
-        scheduler="CosineAnnealingWarmRestarts"
+        num_selected_features=450,
+        dropout=0.4,
+        focal_alpha=0.75,
+        focal_gamma=2.5,
+        pos_weight=8.0,
+        uncertainty_weight=0.005,
+        label_smoothing=0.1,
+        dataset="Balanced Enhanced Faces Dataset",
+        architecture="Advanced-BalancedQuantumInceptionResnetV1",
+        augmentation_strategy="class_aware_heavy_real",
+        sampling_strategy="weighted_oversampling",
+        loss_function="adaptive_focal_with_uncertainty"
     )
     
-    print(f"🖥️ Running on device: {DEVICE.upper()}")
-    print(f"🔬 Enhanced Quantum Training Configuration:")
+    print(f"Running on device: {DEVICE.upper()}")
+    print("Advanced Balanced Quantum Training Configuration:")
     for key, value in hyperparameters.items():
-        print(f"   {key}: {value}")
+        print(f"  {key}: {value}")
     
-    model, history = model_pipeline_enhanced(hyperparameters)
-    print("🎉 Enhanced quantum training completed!")
+    model, history = model_pipeline_balanced(hyperparameters)
+    print("Advanced balanced quantum training completed!")

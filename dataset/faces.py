@@ -48,7 +48,10 @@ class FaceDataset(Dataset):
         
         # Construct the full image path
         # The label (real/fake) is part of the path
-        image_path = os.path.join(self.data_folder, "faces", label_str, image_name)
+        # FIX: Explicitly cast path components to strings to prevent TypeError.
+        # The traceback indicates that a value was being interpreted as a
+        # numeric type (int64), which os.path.join cannot handle.
+        image_path = os.path.join(self.data_folder, "faces", str(label_str), str(image_name))
         
         # Read the image using OpenCV
         image = cv2.imread(image_path)
