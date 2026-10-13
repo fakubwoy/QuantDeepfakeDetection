@@ -1,107 +1,149 @@
-# Quantum DeepFake Detection
+# Quantum-Hybrid Deepfake Detection
 
-The objective of this project is to distinguish between computer-generated (deepfake) and real individuals appearing in a video. However, it is important to note that this project is not optimized for identifying hyper-realistic generated images, but instead primarily focuses on analyzing screenshots taken from a video.
+Face-level deepfake detection on FaceForensics++ with a classical InceptionResNetV1 backbone, QAOA-based feature selection and a quantum-inspired attention layer.
 
-You can try the [deepfake detector](https://github.com/fakubwoy/QuantDeepfakeDetection) by uploading a screenshot from a deepfake video (for example from YouTube) and see the results.
+[![Paper](https://img.shields.io/badge/IEEE%20Access-10.1109%2FACCESS.2026.3659021-00629B)](https://doi.org/10.1109/ACCESS.2026.3659021)
+![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C?logo=pytorch&logoColor=white)
+![Qiskit](https://img.shields.io/badge/Qiskit-QAOA-6929C4?logo=qiskit&logoColor=white)
 
+Code for the paper *A Quantum-Hybrid Framework for Enhanced Deepfake Detection: Integrating QAOA-Based Feature Selection with Quantum-Inspired Attention Mechanisms* (IEEE Access, 2026).
 
-## Getting Started 
- Clone the repository:
+## Overview
+
+The detector works on individual face crops taken from video frames, not on full videos or high-resolution synthetic images.
+
+1. **Face dataset**: frames are sampled from FaceForensics++ real and manipulated sequences, faces are cropped with MTCNN, and blurry crops are dropped using variance of the Laplacian.
+2. **Backbone**: InceptionResNetV1 pretrained on VGGFace2 produces a 512-d embedding per face.
+3. **QAOA feature selection**: mutual information between each embedding dimension and the label defines a cost Hamiltonian (`SparsePauliOp`), which Qiskit's `QAOA` (COBYLA optimizer) minimizes to pick a feature subset. The implementation falls back to classical top-k mutual information selection when the feature count is too large to simulate.
+4. **Quantum-inspired attention**: learnable real and imaginary amplitudes reweight features by their normalized probability, then scaled dot-product attention with a residual connection.
+5. **Head**: an MLP classifier outputs a single real/fake logit, trained with BCE plus a variance-based uncertainty regularizer.
+
+Grad-CAM over the backbone's last block is used to visualize which facial regions drive a prediction.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A["FaceForensics++ videos"] --> B["Frame sampling"]
+    B --> C["MTCNN face crop"]
+    C --> D["Blur filter (Laplacian variance)"]
+    D --> E["faces.csv + face crops"]
+    E --> F["InceptionResNetV1 (VGGFace2), 512-d embedding"]
+    F --> G["Mutual information scores"]
+    G --> H["QAOA feature selection (Qiskit)"]
+    F --> I["Selected features"]
+    H --> I
+    I --> J["Quantum-inspired attention"]
+    J --> K["MLP head"]
+    K --> L["Real / fake probability"]
+    F -.-> M["Grad-CAM heatmap"]
+```
+
+## Results
+
+From the published paper, evaluated on FaceForensics++:
+
+| Metric | Quantum-hybrid vs. classical baselines |
+| --- | --- |
+| Accuracy | +2.5 points |
+| Calibration error | 45% lower |
+
+See the paper for the full experimental setup, baselines and ablations.
+
+## Repository structure
+
+```
+.
+├── dataset/
+│   ├── download.py               # FaceForensics++ download script
+│   ├── create_face_dataset.ipynb # frame sampling + MTCNN face crops + faces.csv
+│   ├── blur_detection.py         # drops blurry crops (variance of Laplacian)
+│   ├── faces.py                  # FaceDataset (PyTorch Dataset over faces.csv)
+│   └── constants.py
+├── models/
+│   ├── cnn.py                    # HybridCNN: small CNN + Qiskit EstimatorQNN layer
+│   └── *.pth                     # checkpoints (Git LFS)
+├── utils/                        # accuracy metric, image denormalization, config helper
+├── examples/                     # sample real and fake frames for the demo
+├── training.py                   # classical InceptionResNetV1 baseline training
+├── training.ipynb                # notebook version of the baseline training
+├── interpy.py                    # Gradio demo with Grad-CAM
+├── inference-gradio.ipynb        # notebook version of the demo
+└── requirements.txt
+```
+
+The QAOA feature selector, quantum-inspired attention and the full hybrid training loop (`models/quantum_cnn.py`, `qtraining.py`, `interquantum.py`) live on the [`hybrid`](https://github.com/fakubwoy/QuantDeepfakeDetection/tree/hybrid) branch.
+
+## Setup
+
 ```sh
 git clone https://github.com/fakubwoy/QuantDeepfakeDetection.git
-```
+cd QuantDeepfakeDetection
 
-## Project Structure 
-
-```
-deepfake-detection
-│
-└───dataset             # React component files
-│   │   download.py     # Python script to download the dataset
-│
-data                    # The dataset will be stored here
-│   │   ...
-│
-metrics                 # Metrics to be used in the model
-│   │   ...
-│
-└───models              # Models to be used in the project
-│   │   ...
-│
-└───saves               # Checkpoints & State Dicts of PyTorch
-│   │   ...
-│
-└───utils               # Utility files (e.g. helper functions for visualization)
-│   │   ...
-│
-│ training.py           # Python Script for training the model
-│ training.ipynb        # Python Notebook for training the model
-│
-│ README.md
-│ LICENSE  
-│ gitignore  
-```
-
-## Set-Up Environment  
-### Install the necessary dependencies
-1. Create and activate a new conda environment:
-```
-conda create --name deepfake_env python=3.8
+conda create -n deepfake_env python=3.8
 conda activate deepfake_env
-```
-2. Install dependencies using requirements.txt:
-
-```
 pip install -r requirements.txt
+pip install pandas scikit-learn wandb qiskit qiskit-machine-learning qiskit-algorithms
 ```
 
-### Download the dataset
-If you want to see the arguments that can be passed to download the dataset, run the following command:
+`requirements.txt` covers the classical pipeline and demo. The extra packages are needed by `training.py` (pandas, scikit-learn, wandb) and by the quantum models (Qiskit).
 
+Model checkpoints are stored with Git LFS:
 
-1. Download the FaceForensics++ dataset:
+```sh
+git lfs install
+git lfs pull
+```
+
+## Usage
+
+**1. Download FaceForensics++** (requires accepting the dataset's terms of use):
+
 ```sh
 python3 dataset/download.py data -c c40 -d DeepFakeDetection --server EU2
 python3 dataset/download.py data -c c40 -d DeepFakeDetection_original --server EU2
 ```
 
+**2. Build the face dataset**: run `dataset/create_face_dataset.ipynb`, which writes crops and `data/faces/faces.csv`. Optionally remove blurry crops:
 
-## Download the Pretrained Model 
-
-This project uses a pretrained classifier model (`resnetinceptionv1_epoch_32.pth`) for inference. Make sure to download this file and place it in the `models/` directory.
-
-You can get the model file by running:
-
-```bash
-git lfs install
-git lfs pull --include="models/resnetinceptionv1_epoch_32.pth"
-```
-If you have not cloned the repo with git lfs, you can install Git LFS and then pull the file manually. Otherwise, you'll see a pointer file instead of the actual model weights, which will result in loading errors.
-## Train the model 
 ```sh
- python training.py
+python3 dataset/blur_detection.py data/faces/<folder>
 ```
 
-## Dataset
+**3. Train the classical baseline** (InceptionResNetV1, 15 epochs, logs to Weights & Biases, saves the best checkpoint to `models/best_resnetinceptionv1.pth`):
 
-[FaceForensics](http://niessnerlab.org/projects/roessler2018faceforensics.html): A Large-scale Video Dataset for Forgery Detection in Human Faces.
+```sh
+python training.py
+```
 
-[FakeCatcher](http://cs.binghamton.edu/~ncilsal2/DeepFakesDataset/): Dataset of synthesized images for deepfake detection.
+**4. Train the quantum-hybrid model** (on the `hybrid` branch):
 
-[Kaggle Dataset augmented by Meta](https://ai.facebook.com/datasets/dfdc/): Dataset from the kaggle competition with more resources provided by Meta.
+```sh
+git checkout hybrid
+python qtraining.py
+```
 
-## TODO: Quantum Enhanced Deepfake Detection
+**5. Run the demo** (loads `models/resnetinceptionv1_epoch_32.pth`, shows real/fake confidence and a Grad-CAM overlay):
 
-This section outlines future research to explore how quantum algorithms can improve deepfake detection. Quantum Machine Learning (QML) could offer significant advantages due to its ability to process complex data in unique ways.
+```sh
+python interpy.py
+```
 
-### Research & Implementation Areas:
+## Citation
 
-* **Quantum Feature Detection:** Use quantum methods to find tiny, hidden patterns in deepfakes that classical methods might miss.
-* **Hybrid Quantum-Classical Models:** Combine our existing PyTorch models with quantum components to boost accuracy and resilience.
-* **Quantum Kernels:** Explore quantum techniques that make it easier to separate real from fake data, potentially leading to better classification.
-* **Quantum GANs (QGANs):** Investigate using QGANs to understand how deepfakes are created (for defense) or even to generate new, harder-to-detect fakes for testing.
-* **Quantum Frequency Analysis:** Apply quantum versions of signal processing to analyze video frames for deepfake artifacts in the frequency domain.
-* **Quantum Optimization:** Use quantum algorithms to make our detection models train faster or perform better.
-* **Quantum Tools & Platforms:** Experiment with quantum programming tools like Qiskit or PennyLane to test these ideas.
+```bibtex
+@article{khan2026quantumhybrid,
+  author  = {Khan, Farhaan and Sareen, A. and Kumar, A. S. and Bhuvaneswari, M.},
+  title   = {A Quantum-Hybrid Framework for Enhanced Deepfake Detection: Integrating {QAOA}-Based Feature Selection with Quantum-Inspired Attention Mechanisms},
+  journal = {IEEE Access},
+  volume  = {14},
+  pages   = {17853--17873},
+  year    = {2026},
+  doi     = {10.1109/ACCESS.2026.3659021}
+}
+```
 
-Ultimately, we aim for **more accurate, efficient, and robust deepfake detection** by leveraging the power of quantum computing.
+## Authors
+
+Farhaan Khan, A. Sareen, A. S. Kumar, M. Bhuvaneswari
