@@ -124,7 +124,7 @@ git checkout hybrid
 python qtraining.py
 ```
 
-**5. Run the demo** (loads `models/resnetinceptionv1_epoch_32.pth`, shows real/fake confidence and a Grad-CAM overlay):
+**5. Run the demo** (loads `models/resnetinceptionv1_epoch_32.pth`, shows real/fake confidence and a Grad-CAM overlay). That checkpoint is not included in the repo, so train one first with step 3 and save or rename it to that path:
 
 ```sh
 python interpy.py
